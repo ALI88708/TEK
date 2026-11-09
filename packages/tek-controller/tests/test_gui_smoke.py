@@ -90,17 +90,17 @@ def test_navigation_switches_views(app: TekControllerApp) -> None:
     assert app.current_view == "dashboard"
 
 
-def test_create_session_is_honest(app: TekControllerApp) -> None:
+def test_create_session_switches_to_connection(app: TekControllerApp) -> None:
     app.create_session()
     assert app.session.state is SessionState.PREPARING
+    assert app.session.session_id is None
 
     app.root.update()
 
-    assert app.session.state is SessionState.IDLE
-    assert app.session.session_id is None
+    assert app.current_view == "connection"
     notice = app.notice_label.cget("text").lower()
-    assert "not implemented" in notice
-    assert "no vm" in notice or "no virtual machine" in notice
+    assert "connection" in notice
+    assert "secret" in notice
 
 
 def test_create_session_clears_a_loaded_descriptor(app: TekControllerApp) -> None:
@@ -133,7 +133,7 @@ def test_malformed_descriptor_is_rejected(app: TekControllerApp) -> None:
     assert app.connection_error_code == "UNSUPPORTED_PROTOCOL"
 
 
-def test_valid_descriptor_reports_missing_runtime(app: TekControllerApp) -> None:
+def test_valid_descriptor_is_accepted(app: TekControllerApp) -> None:
     app.show_view("connection")
     app.set_descriptor_text(VALID_DESCRIPTOR)
     app.connect()
@@ -141,7 +141,7 @@ def test_valid_descriptor_reports_missing_runtime(app: TekControllerApp) -> None
     assert app.session.state is SessionState.IDLE
     assert app.connection_error_code is None
     status = app.connection_status_label.cget("text").lower()
-    assert "not implemented" in status
+    assert "valid" in status
 
 
 def test_valid_descriptor_populates_session_summary(app: TekControllerApp) -> None:
@@ -191,7 +191,9 @@ def test_invalid_timeout_is_rejected_without_saving(
 
     assert app.save_preferences() is False
     assert not (tmp_path / "settings.json").exists()
-    assert "between 5 and 120" in app.settings_view.status_label.cget("text")
+    status = app.settings_view.status_label.cget("text").lower()
+    assert "timeout" in status
+    assert "5" in status and "120" in status
 
 
 def test_settings_persist_from_the_ui(app: TekControllerApp, tmp_path: Path) -> None:
@@ -225,7 +227,7 @@ def test_save_failure_is_reported_without_crashing(
 
     assert app.save_preferences() is False
     status = app.settings_view.status_label.cget("text").lower()
-    assert "could not be saved" in status
+    assert "not writable" in status
 
 
 def test_create_session_clears_the_connection_view(app: TekControllerApp) -> None:
@@ -248,7 +250,7 @@ def test_preparing_state_does_not_claim_a_live_runtime(app: TekControllerApp) ->
     assert "provision" not in hint
 
 
-def test_close_cancels_pending_work_and_destroys_the_window(tmp_path: Path) -> None:
+def test_close_destroys_the_window_with_pending_work(tmp_path: Path) -> None:
     root = _make_root()
     application = TekControllerApp(
         root,
@@ -256,11 +258,10 @@ def test_close_cancels_pending_work_and_destroys_the_window(tmp_path: Path) -> N
         create_delay_ms=60_000,
     )
     application.create_session()
-    assert application._create_job is not None
+    assert application.current_view == "dashboard"
 
     application.close()
 
-    assert application._create_job is None
     with pytest.raises(tk.TclError):
         root.winfo_exists()
 

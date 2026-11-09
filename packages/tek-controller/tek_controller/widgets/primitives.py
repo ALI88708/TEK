@@ -129,6 +129,13 @@ class ActionButton(tk.Button):
         )
         _hover(self, options["bg"], hover)
 
+    def set_enabled(self, enabled: bool) -> None:
+        """Enable or disable the button, including its pointer cursor."""
+        self.configure(
+            state="normal" if enabled else "disabled",
+            cursor="hand2" if enabled else "arrow",
+        )
+
 
 class StatusPill(tk.Frame):
     """Current session state as an outlined chip."""

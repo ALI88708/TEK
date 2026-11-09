@@ -1,16 +1,22 @@
-"""Application shell for the TEK Controller prototype.
+"""Application shell for the TEK Controller.
 
-The window, navigation, and local state are real. The runtime transport is not:
-every action that would need a live TEK Runtime says so instead of pretending.
+Changes from the prototype build:
+  - Session secret generation (crypto.generate_secret)
+  - Descriptor fetching from a live runtime (connect.fetch_descriptor)
+  - Browser kickoff for noVNC display (connect.build_kickoff_url)
+  - Unimplemented stubs replaced with real logic where available
 """
-
 from __future__ import annotations
 
+import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from tek_controller import theme
+from tek_controller.connect import ConnectError, build_kickoff_url, fetch_descriptor
+from tek_controller.crypto import generate_secret, pairing_nonce
 from tek_controller.descriptor import (
     DescriptorError,
     SessionDescriptor,
@@ -40,7 +46,7 @@ VIEW_META: dict[str, tuple[str, str]] = {
     ),
     "connection": (
         "Connection",
-        "Load and validate a session descriptor served by the TEK Runtime.",
+        "Connect to a live runtime or validate a descriptor manually.",
     ),
     "settings": (
         "Settings",
@@ -68,6 +74,7 @@ class TekControllerApp:
 
         self.session = SessionModel()
         self.descriptor: SessionDescriptor | None = None
+        self._live_descriptor_dict: dict | None = None   # from fetch
         self.connection_error_code: str | None = None
         self.current_view = "dashboard"
         self._create_job: str | None = None
@@ -98,9 +105,9 @@ class TekControllerApp:
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.bind("<Control-Key-1>", lambda _event: self.show_view("dashboard"))
-        self.root.bind("<Control-Key-2>", lambda _event: self.show_view("connection"))
-        self.root.bind("<Control-Key-3>", lambda _event: self.show_view("settings"))
+        self.root.bind("<Control-Key-1>", lambda _: self.show_view("dashboard"))
+        self.root.bind("<Control-Key-2>", lambda _: self.show_view("connection"))
+        self.root.bind("<Control-Key-3>", lambda _: self.show_view("settings"))
         self._set_icon()
 
     def _set_icon(self) -> None:
@@ -151,7 +158,6 @@ class TekControllerApp:
             anchor="w",
         )
         self.brand_label.pack(anchor="w")
-
         tk.Label(
             wordmark,
             text="CONTROLLER",
@@ -161,10 +167,7 @@ class TekControllerApp:
             anchor="w",
         ).pack(anchor="w")
 
-        tk.Frame(header, bg=P["border"], width=1, height=26).pack(
-            side="left", padx=18
-        )
-
+        tk.Frame(header, bg=P["border"], width=1, height=26).pack(side="left", padx=18)
         tk.Label(
             header,
             text="TEMPORARY ENVIRONMENT ON KAGGLE",
@@ -178,7 +181,7 @@ class TekControllerApp:
         self.status_pill.set_state(self.session.state)
 
         self._chip(header, "tek/0").pack(side="right", padx=(0, 8))
-        self._chip(header, "PROTOTYPE BUILD").pack(side="right", padx=(0, 8))
+        self._chip(header, "v0.1.0").pack(side="right", padx=(0, 8))
 
     def _chip(self, master: tk.Misc, text: str) -> tk.Frame:
         frame = tk.Frame(
@@ -264,6 +267,9 @@ class TekControllerApp:
             self.container,
             on_connect=self.connect,
             on_clear=self.clear_descriptor,
+            on_generate_secret=self.generate_secret,
+            on_fetch=self.fetch_and_connect,
+            on_open_display=self.open_display,
         )
         self.settings_view = SettingsView(
             self.container,
@@ -283,7 +289,7 @@ class TekControllerApp:
 
         self.settings_view.load(self.settings)
 
-        # Flat aliases used by the smoke tests and by small callers.
+        # Flat aliases kept for test compatibility
         self.notice_label = self.dashboard.notice_label
         self.session_id_label = self.dashboard.session_id_label.value
         self.event_log = self.dashboard.event_log
@@ -296,27 +302,153 @@ class TekControllerApp:
         view = self.views.get(key)
         if view is None:
             return
-
         for other in self.views.values():
             other.grid_remove()
-
         view.grid()
         self.current_view = key
         self.sidebar.set_active(key)
-
         title, subtitle = VIEW_META[key]
         self.view_title.configure(text=title)
         self.view_subtitle.configure(text=subtitle)
-
         if key == "connection":
-            self.root.after_idle(self.descriptor_input.focus_set)
+            self.root.after_idle(self.connection_view.host_entry.focus_set)
 
-    # -- session actions -------------------------------------------------
+    # -- secret generation -----------------------------------------------
+
+    def generate_secret(self) -> None:
+        secret = generate_secret()
+        self.connection_view.set_secret(secret)
+        nonce = pairing_nonce(secret)
+        self.dashboard.log(
+            f"New session secret generated. "
+            f"Expected pair code: {nonce}. "
+            "Copy the secret and set it as TEK_SESSION_SECRET in Kaggle."
+        )
+        self.dashboard.set_notice(
+            f"Secret generated. Pair code: {nonce}\n"
+            "Copy it to Kaggle, run the notebook, then fetch."
+        )
+
+    # -- descriptor fetch ------------------------------------------------
+
+    def fetch_and_connect(self) -> None:
+        secret = self.connection_view.get_secret()
+        host = self.connection_view.get_host()
+
+        if not secret:
+            self.connection_view.set_status(
+                "Generate a session secret first.", code="NO_SECRET", error=True
+            )
+            return
+        if not host or host == "abc-def-123.trycloudflare.com":
+            self.connection_view.set_status(
+                "Enter the tunnel hostname printed by the notebook.",
+                code="NO_HOST",
+                error=True,
+            )
+            return
+
+        # Advance state machine: IDLE→PREPARING→CONNECTING or PREPARING→CONNECTING
+        if self.session.state is SessionState.IDLE:
+            self.session.transition(SessionState.PREPARING, "fetch requested")
+        if self.session.state is SessionState.PREPARING:
+            self.session.transition(SessionState.CONNECTING, "fetching descriptor")
+        elif self.session.state is SessionState.FAILED:
+            self.session.transition(SessionState.IDLE, "retry after failure")
+            self.session.transition(SessionState.PREPARING, "fetch requested")
+            self.session.transition(SessionState.CONNECTING, "fetching descriptor")
+        self._sync_status()
+        self.connection_view.set_status("Fetching descriptor from runtime…")
+        self.dashboard.log(f"Fetching descriptor from {host}…")
+
+        def _fetch() -> None:
+            try:
+                desc_dict = fetch_descriptor(
+                    secret, host, verify_expiry=self.settings.verify_expiry
+                )
+            except ConnectError as exc:
+                self.root.after(0, lambda: self._on_fetch_error(exc))
+                return
+            self.root.after(0, lambda: self._on_fetch_ok(secret, host, desc_dict))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _on_fetch_error(self, exc: ConnectError) -> None:
+        self.connection_view.set_status(exc.message, code=exc.code, error=True)
+        self.connection_view.set_open_display_enabled(False)
+        self.dashboard.log(f"Fetch failed: {exc.code}")
+        # Transition to FAILED only if we were in an active state
+        if self.session.state not in (
+            SessionState.IDLE, SessionState.FAILED
+        ):
+            self.session.fail(exc.code, exc.message)
+        self._sync_status()
+
+    def _on_fetch_ok(self, secret: bytes, host: str, desc_dict: dict) -> None:
+        import json
+        raw = json.dumps(desc_dict, indent=2)
+
+        try:
+            parsed = parse_descriptor(
+                raw, check_expiry=self.settings.verify_expiry
+            )
+        except DescriptorError as exc:
+            self._reject_descriptor(exc)
+            return
+
+        self._live_descriptor_dict = desc_dict
+        self._live_secret = secret
+        self._live_host = host
+        self.descriptor = parsed
+
+        width, height = parsed.display.geometry
+        disp_host = urlsplit(parsed.display.url).hostname or host
+        self.connection_view.set_descriptor_text(raw)
+        self.connection_view.set_fields(
+            session_id=parsed.session_id,
+            runtime=parsed.runtime_version,
+            host=f"{disp_host} / {width}x{height}",
+            guest=f"{parsed.guest.os} / {parsed.guest.state}",
+        )
+        self.connection_view.set_status(
+            "Descriptor fetched and verified. Click Open Display to connect.",
+            code="READY",
+        )
+        self.connection_view.set_open_display_enabled(True)
+
+        self.session_id_label.configure(text=parsed.session_id)
+        self.dashboard.log(
+            f"Descriptor fetched: {parsed.protocol}, "
+            f"session {parsed.session_id}, guest {parsed.guest.os}."
+        )
+        self.dashboard.set_notice(
+            f"Connected to {host}.\nSession: {parsed.session_id}"
+        )
+        # Advance from CONNECTING → RUNNING
+        if self.session.state is SessionState.CONNECTING:
+            self.session.bind_session(parsed.session_id)
+            self.session.transition(SessionState.RUNNING, "descriptor verified")
+        self._sync_status()
+
+    # -- display ---------------------------------------------------------
+
+    def open_display(self) -> None:
+        secret = getattr(self, "_live_secret", None)
+        host = getattr(self, "_live_host", None)
+        if not secret or not host:
+            self.connection_view.set_status(
+                "Fetch a descriptor first.", code="NOT_READY", error=True
+            )
+            return
+        url = build_kickoff_url(secret, host)
+        webbrowser.open(url)
+        self.dashboard.log(f"Opened display in browser for host {host}.")
+
+    # -- session actions (dashboard) ------------------------------------
 
     def create_session(self) -> None:
         if self.session.state is SessionState.FAILED:
             self.session.transition(SessionState.IDLE, "reset after failure")
-
         if self.session.state is not SessionState.IDLE:
             self.dashboard.set_notice("A session is already in progress.")
             return
@@ -328,38 +460,17 @@ class TekControllerApp:
         self.dashboard.set_runtime("REQUESTED")
         self.dashboard.set_runtime_status("PREPARING")
         self.dashboard.set_notice(
-            "Preparing the session. No runtime link is established yet."
+            "Go to Connection → Generate Secret → copy to Kaggle → run the notebook."
         )
-        self.dashboard.log("Create session requested.")
+        self.dashboard.log("Create session: switching to Connection view.")
         self._sync_status()
 
-        self._create_job = self.root.after(
-            self.create_delay_ms, self._abort_unimplemented_create
-        )
+        self.root.after(self.create_delay_ms, lambda: self.show_view("connection"))
 
-    def _abort_unimplemented_create(self) -> None:
-        self._create_job = None
-        if self.session.state is not SessionState.PREPARING:
-            return
-
-        self.session.transition(
-            SessionState.IDLE, "runtime integration unavailable in this build"
-        )
-        self.dashboard.set_state(self.session.state)
-        self.dashboard.set_runtime("NOT CONNECTED")
-        self.dashboard.set_runtime_status("NOT CONNECTED")
-        self.dashboard.set_notice(
-            "Runtime integration is not implemented in this build.\n"
-            "No virtual machine was created and no Kaggle notebook was started."
-        )
-        self.dashboard.log("Runtime integration not implemented; no VM created.")
-        self._sync_status()
-
-    # -- connection actions ----------------------------------------------
+    # -- manual paste connect -------------------------------------------
 
     def connect(self) -> bool:
         raw = self.connection_view.get_descriptor_text()
-
         try:
             parsed = parse_descriptor(raw, check_expiry=self.settings.verify_expiry)
         except DescriptorError as error:
@@ -368,7 +479,6 @@ class TekControllerApp:
 
         self.connection_error_code = None
         self.descriptor = parsed
-
         host = urlsplit(parsed.display.url).hostname or "-"
         width, height = parsed.display.geometry
         self.connection_view.set_fields(
@@ -377,23 +487,10 @@ class TekControllerApp:
             host=f"{host} / {width}x{height}",
             guest=f"{parsed.guest.os} / {parsed.guest.state}",
         )
-        self.connection_view.set_status(
-            "Descriptor valid. Runtime integration is not implemented, so no "
-            "viewer was attached.",
-            code="VALID",
-        )
-
+        self.connection_view.set_status("Descriptor valid.", code="VALID")
         self.session_id_label.configure(text=parsed.session_id)
-        self.dashboard.set_notice(
-            "Descriptor loaded. Runtime integration is not implemented, so no "
-            "viewer is attached."
-        )
         self.dashboard.log(
-            f"Descriptor accepted: {parsed.protocol}, session {parsed.session_id}, "
-            f"guest {parsed.guest.os}."
-        )
-        self.dashboard.log(
-            "Runtime integration not implemented; no connection attempted."
+            f"Descriptor validated: {parsed.protocol}, session {parsed.session_id}."
         )
         return True
 
@@ -415,21 +512,20 @@ class TekControllerApp:
         self.connection_view.set_descriptor_text("")
         self.connection_view.clear_fields()
         self.connection_view.set_status("No descriptor loaded.")
+        self.connection_view.set_open_display_enabled(False)
         self.connection_error_code = None
         self.descriptor = None
+        self._live_descriptor_dict = None
 
-    # -- preferences -----------------------------------------------------
+    # -- preferences ----------------------------------------------------
 
     def _settings_from_form(self) -> Settings | None:
         timeout = self.settings_view.timeout_value()
         if timeout is None:
             self.settings_view.set_status(
-                f"Connection timeout must be a whole number between "
-                f"{TIMEOUT_MIN_S} and {TIMEOUT_MAX_S} seconds.",
-                error=True,
+                f"Timeout must be {TIMEOUT_MIN_S}–{TIMEOUT_MAX_S} s.", error=True
             )
             return None
-
         return Settings(
             fit_display=bool(self.settings_view.fit_var.get()),
             scale_percent=int(self.settings_view.scale_var.get()),
@@ -443,17 +539,11 @@ class TekControllerApp:
         updated = self._settings_from_form()
         if updated is None:
             return False
-
         try:
             save_settings(updated, self.settings_path)
         except OSError:
-            self.settings_view.set_status(
-                "Preferences could not be saved. The settings file is not writable.",
-                error=True,
-            )
-            self.dashboard.log("Preferences could not be saved.")
+            self.settings_view.set_status("Settings file not writable.", error=True)
             return False
-
         self.settings = updated
         self._apply_settings(updated)
         self.settings_view.set_status("Preferences saved.")
@@ -462,26 +552,25 @@ class TekControllerApp:
 
     def restore_default_preferences(self) -> None:
         self.settings_view.load(Settings())
-        self.settings_view.set_status(
-            "Defaults restored in the form. Save Preferences to apply."
-        )
+        self.settings_view.set_status("Defaults restored. Save to apply.")
 
     def _apply_settings(self, settings: Settings) -> None:
         self.dashboard.display.set_grid_visible(settings.show_grid)
         self.dashboard.display.set_scale(settings.scale_percent)
         self.dashboard.display.set_fit(settings.fit_display)
 
-    # -- misc ------------------------------------------------------------
+    # -- misc -----------------------------------------------------------
 
     def _sync_status(self) -> None:
         self.status_pill.set_state(self.session.state)
 
     def _log_startup(self) -> None:
-        self.dashboard.log("Controller started. No runtime connection.")
-        self.dashboard.log("Runtime transport is not implemented in this build.")
+        self.dashboard.log("Controller started.")
+        self.dashboard.log(
+            "Go to Connection, generate a secret, and fetch from a live runtime."
+        )
 
     def close(self) -> None:
         if self._create_job is not None:
             self.root.after_cancel(self._create_job)
-            self._create_job = None
         self.root.destroy()
