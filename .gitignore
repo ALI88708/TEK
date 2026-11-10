@@ -218,3 +218,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# TEK-specific
+*.iso
+*.qcow2
+*.img
+/tmp/tek-*
+**/dist/
+**/build/
+packages/*/tek_*.egg-info/
+# Credentials and secrets — NEVER commit
+*.pem
+*.key
+TEK_SESSION_SECRET*
+# QEMU and tunnel logs
+tek-qemu.log
+tek-cloudflared.log
