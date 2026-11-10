@@ -323,3 +323,96 @@ def test_websocket_upgrade_and_pipe_e2e():
 @pytest.mark.skip(reason="NOT_RUN: requires real Cloudflare tunnel for Origin header")
 def test_origin_check_with_tunnel_host():
     pass
+
+
+# ======================================================================
+# WebSocket pipe — real bidirectional data flow (socketpair, no network)
+# ======================================================================
+
+class TestPipeE2E:
+    """Integration: exercise _pipe() with real sockets and real data."""
+
+    def test_data_flows_bidirectionally(self):
+        """INTEGRATION: bytes sent on one side arrive on the other."""
+        import threading
+        from tek_runtime.authproxy import _pipe
+
+        a, b = socket.socketpair()
+        result_a_to_b = []
+        result_b_to_a = []
+
+        def run_pipe():
+            _pipe(a, b)
+
+        t = threading.Thread(target=run_pipe, daemon=True)
+        t.start()
+
+        # a → b
+        a.sendall(b"hello from a")
+        data_b = b""
+        while len(data_b) < len(b"hello from a"):
+            chunk = b.recv(64)
+            if not chunk:
+                break
+            data_b += chunk
+        result_a_to_b.append(data_b)
+
+        # b → a
+        b.sendall(b"hello from b")
+        data_a = b""
+        while len(data_a) < len(b"hello from b"):
+            chunk = a.recv(64)
+            if not chunk:
+                break
+            data_a += chunk
+        result_b_to_a.append(data_a)
+
+        # Close both sides to terminate the pipe
+        a.close()
+        b.close()
+        t.join(timeout=3)
+
+        assert result_a_to_b[0] == b"hello from a"
+        assert result_b_to_a[0] == b"hello from b"
+
+    def test_pipe_terminates_when_one_side_closes(self):
+        """INTEGRATION: _pipe() must return when one socket is closed."""
+        import threading
+        from tek_runtime.authproxy import _pipe
+
+        a, b = socket.socketpair()
+        done = threading.Event()
+
+        def run_pipe():
+            _pipe(a, b)
+            done.set()
+
+        t = threading.Thread(target=run_pipe, daemon=True)
+        t.start()
+
+        a.close()   # close one side
+        assert done.wait(timeout=5), "_pipe() did not terminate within 5 s"
+        b.close()
+
+    def test_proxy_stop_unblocks_active_pipe(self):
+        """INTEGRATION: proxy.stop() must unblock a _pipe() that is waiting."""
+        import threading
+        from tek_runtime.authproxy import _pipe
+
+        proxy = AuthProxy(secret=generate_secret())
+        a, b = socket.socketpair()
+        proxy._register_pipe(a, b)
+
+        done = threading.Event()
+
+        def run_pipe():
+            _pipe(a, b)
+            done.set()
+
+        t = threading.Thread(target=run_pipe, daemon=True)
+        t.start()
+
+        time.sleep(0.1)
+        proxy.stop()   # must close a and b, unblocking _pipe()
+
+        assert done.wait(timeout=5), "proxy.stop() did not unblock the pipe within 5 s"

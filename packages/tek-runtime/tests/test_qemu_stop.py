@@ -18,6 +18,16 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent.parent
 import tek_runtime.qemu as Q
 
 
+def _spawn_sleeper(seconds: float) -> subprocess.Popen:
+    """Spawn a real child process that sleeps (portable: no Unix `sleep`)."""
+    return subprocess.Popen(
+        [sys.executable, "-c", f"import time; time.sleep({seconds})"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 @pytest.fixture(autouse=True)
 def reset_module():
     Q._proc   = None
@@ -43,18 +53,13 @@ def reset_module():
 # ------------------------------------------------------------------ #
 
 def test_safe_signal_on_exited_process_does_not_raise():
-    proc = subprocess.Popen(["true"], stdout=subprocess.DEVNULL)
+    proc = _spawn_sleeper(0)
     proc.wait()
     Q._safe_signal(proc, signal.SIGTERM)   # must not raise
 
 
 def test_safe_signal_terminates_running_process():
-    proc = subprocess.Popen(
-        ["sleep", "60"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    proc = _spawn_sleeper(60)
     Q._safe_signal(proc, signal.SIGTERM)
     proc.wait(timeout=3)
     assert proc.poll() is not None
@@ -65,22 +70,12 @@ def test_safe_signal_terminates_running_process():
 # ------------------------------------------------------------------ #
 
 def test_wait_for_exit_true_when_process_exits():
-    Q._proc = subprocess.Popen(
-        ["sleep", "0.05"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    Q._proc = _spawn_sleeper(0.05)
     assert Q._wait_for_exit(5) is True
 
 
 def test_wait_for_exit_false_when_process_hangs():
-    Q._proc = subprocess.Popen(
-        ["sleep", "60"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    Q._proc = _spawn_sleeper(60)
     assert Q._wait_for_exit(0.2) is False
 
 
@@ -104,14 +99,8 @@ def test_cleanup_all_closes_log_fd():
 
 
 def test_cleanup_all_clears_proc():
-    Q._proc = subprocess.Popen(
-        ["sleep", "60"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    pid = Q._proc.pid
-    os.kill(pid, signal.SIGKILL)
+    Q._proc = _spawn_sleeper(60)
+    Q._proc.terminate()
     Q._proc.wait()
     Q._cleanup_all()
     assert Q._proc is None
@@ -128,12 +117,7 @@ def test_stop_safe_when_no_process():
 
 
 def test_stop_kills_process_responding_to_sigterm():
-    Q._proc = subprocess.Popen(
-        ["sleep", "60"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    Q._proc = _spawn_sleeper(60)
     pid = Q._proc.pid
     Q.stop()
 
@@ -142,7 +126,7 @@ def test_stop_kills_process_responding_to_sigterm():
     try:
         os.kill(pid, 0)
         still_alive = True
-    except ProcessLookupError:
+    except OSError:
         still_alive = False
     assert not still_alive, f"PID {pid} still alive after stop()"
 
@@ -150,12 +134,7 @@ def test_stop_kills_process_responding_to_sigterm():
 def test_stop_clears_proc_and_log_fd():
     import tempfile
     Q._log_fd = open(tempfile.mktemp(), "w")
-    Q._proc   = subprocess.Popen(
-        ["sleep", "60"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    Q._proc   = _spawn_sleeper(60)
     fd = Q._log_fd
     Q.stop()
 
@@ -213,3 +192,65 @@ def test_full_qemu_start_on_kaggle():
 @pytest.mark.skip(reason="NOT_RUN: SIGKILL path requires process ignoring SIGTERM")
 def test_sigkill_escalation_on_stubborn_process():
     pass
+
+
+# ------------------------------------------------------------------ #
+# SIGKILL escalation — real process that ignores SIGTERM              #
+# ------------------------------------------------------------------ #
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="SIGTERM cannot be ignored on Windows; POSIX-only escalation test",
+)
+def test_sigkill_escalation_kills_sigterm_ignoring_process():
+    """INTEGRATION: a process that traps SIGTERM must be killed by SIGKILL."""
+    import tempfile, textwrap
+
+    # Write a small Python script that ignores SIGTERM
+    script = textwrap.dedent("""\
+        import signal, time
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        while True:
+            time.sleep(0.1)
+    """)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False
+    ) as f:
+        f.write(script)
+        script_path = f.name
+
+    # Start the stubborn process
+    Q._proc = subprocess.Popen(
+        [sys.executable, script_path],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pid = Q._proc.pid
+
+    # Shorten timeouts so the test completes quickly
+    orig_pw  = Q._POWERDOWN_WAIT_S
+    orig_st  = Q._SIGTERM_WAIT_S
+    orig_sk  = Q._SIGKILL_WAIT_S
+    Q._POWERDOWN_WAIT_S = 0.3
+    Q._SIGTERM_WAIT_S   = 0.5
+    Q._SIGKILL_WAIT_S   = 3.0
+    try:
+        Q.stop()
+    finally:
+        Q._POWERDOWN_WAIT_S = orig_pw
+        Q._SIGTERM_WAIT_S   = orig_st
+        Q._SIGKILL_WAIT_S   = orig_sk
+        try:
+            os.remove(script_path)
+        except OSError:
+            pass
+
+    assert Q._proc is None, "_proc must be cleared after stop()"
+    time.sleep(0.1)
+    try:
+        os.kill(pid, 0)
+        still_alive = True
+    except ProcessLookupError:
+        still_alive = False
+    assert not still_alive, f"PID {pid} still alive after SIGKILL escalation"
