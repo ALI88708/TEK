@@ -364,7 +364,9 @@ class TekControllerApp:
         def _fetch() -> None:
             try:
                 desc_dict = fetch_descriptor(
-                    secret, host, verify_expiry=self.settings.verify_expiry
+                    secret, host,
+                    verify_expiry=self.settings.verify_expiry,
+                    timeout_s=self.settings.connect_timeout_s,
                 )
             except ConnectError as exc:
                 self.root.after(0, lambda: self._on_fetch_error(exc))
@@ -374,9 +376,13 @@ class TekControllerApp:
         threading.Thread(target=_fetch, daemon=True).start()
 
     def _on_fetch_error(self, exc: ConnectError) -> None:
-        self.connection_view.set_status(exc.message, code=exc.code, error=True)
+        is_retry = exc.code in ("NOT_READY", "TIMEOUT")
+        msg = exc.message
+        if is_retry:
+            msg += " — click Fetch & Connect to retry."
+        self.connection_view.set_status(msg, code=exc.code, error=not is_retry)
         self.connection_view.set_open_display_enabled(False)
-        self.dashboard.log(f"Fetch failed: {exc.code}")
+        self.dashboard.log(f"Fetch: {exc.code}")
         # Transition to FAILED only if we were in an active state
         if self.session.state not in (
             SessionState.IDLE, SessionState.FAILED
@@ -429,6 +435,7 @@ class TekControllerApp:
             self.session.bind_session(parsed.session_id)
             self.session.transition(SessionState.RUNNING, "descriptor verified")
         self._sync_status()
+        self.dashboard.display.set_state(self.session.state)
 
     # -- display ---------------------------------------------------------
 

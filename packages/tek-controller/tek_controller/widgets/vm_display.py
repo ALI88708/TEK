@@ -18,7 +18,7 @@ _COPY: dict[SessionState, tuple[str, str]] = {
     SessionState.IDLE: ("NO ACTIVE SESSION", "Create a session to attach a display."),
     SessionState.PREPARING: ("PREPARING SESSION", "No runtime link is established yet."),
     SessionState.CONNECTING: ("ATTACHING VIEWER", "No frames received."),
-    SessionState.RUNNING: ("AWAITING RUNTIME FRAME", "Runtime integration is not implemented in this build."),
+    SessionState.RUNNING: ("SESSION ACTIVE", "Click 'Open Display' to view the guest OS in your browser (noVNC)."),
     SessionState.STOPPING: ("SESSION STOPPING", "Display detached."),
     SessionState.FAILED: ("SESSION FAILED", "No display available."),
 }

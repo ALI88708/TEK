@@ -159,3 +159,18 @@ def test_unknown_guest_state_is_rejected() -> None:
 def test_summary_never_contains_the_url() -> None:
     parsed = parse_descriptor(descriptor(), now=NOW)
     assert "trycloudflare" not in parsed.summary()
+
+
+# ---- connect.py tests ----
+
+def test_connect_error_not_ready_code() -> None:
+    from tek_controller.connect import ConnectError
+    exc = ConnectError("NOT_READY", "Session is initializing.")
+    assert exc.code == "NOT_READY"
+    assert "initializing" in exc.message
+
+
+def test_connect_error_timeout_code() -> None:
+    from tek_controller.connect import ConnectError
+    exc = ConnectError("TIMEOUT", "No response within 20 s.")
+    assert exc.code == "TIMEOUT"
