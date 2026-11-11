@@ -1,4 +1,16 @@
-"""TEK Runtime session: orchestration + state machine."""
+"""TEK Runtime session: orchestration + state machine.
+
+Idempotency guarantees:
+  - A module-level _active_session guards against creating two sessions in
+    the same Python process (notebook cell re-run). If called a second time
+    while a session is live, start() raises SessionAlreadyRunning.
+  - display.start() and tunnel.start() are idempotent — they skip startup if
+    their respective port / URL is already up.
+
+Cleanup guarantee:
+  - If start() fails at any step, it calls stop() before re-raising so it
+    never leaves orphaned processes.
+"""
 from __future__ import annotations
 
 import threading
@@ -17,19 +29,48 @@ from .detect import summary as detect_summary
 from .plan import make_plan
 
 
+class SessionAlreadyRunning(RuntimeError):
+    """Raised when start() is called while a session is already live."""
+
+
+# Module-level singleton — prevents duplicate sessions in one process.
+_active_session: "TekSession | None" = None
+
+
 class TekSession:
     def __init__(self, iso_path: str | None, secret: bytes) -> None:
-        self.iso_path = iso_path
-        self.secret = secret
-        self.session_id: str = ""
-        self.tunnel_url: str = ""
+        self.iso_path         = iso_path
+        self.secret           = secret
+        self.session_id:  str = ""
+        self.tunnel_url:  str = ""
         self.descriptor_json: str = ""
         self._proxy: AuthProxy | None = None
         self._stop = threading.Event()
+        self._started = False
 
     # ------------------------------------------------------------------ #
 
     def start(self) -> None:
+        global _active_session
+
+        if _active_session is not None and _active_session._started:
+            raise SessionAlreadyRunning(
+                "A TEK session is already running in this process.\n"
+                "Call tek_runtime.stop_active_session() first, "
+                "or restart the Kaggle kernel."
+            )
+
+        try:
+            self._do_start()
+        except Exception:
+            # Clean up whatever was started before re-raising.
+            self._do_stop(quiet=True)
+            raise
+
+        _active_session = self
+        self._started = True
+
+    def _do_start(self) -> None:
         # 1. Detect
         print("=== TEK: detecting resources ===")
         facts = detect_summary()
@@ -37,7 +78,7 @@ class TekSession:
             f"  CPU {facts['cpu']} vCPU | "
             f"RAM {facts['ram_bytes'] // (1024**3):.1f} GB | "
             f"Disk {facts['disk_free_bytes'] // (1024**3):.1f} GB | "
-            f"KVM {'yes' if facts['has_kvm'] else 'no (TCG)'}"
+            f"KVM {'yes ✓' if facts['has_kvm'] else 'no — TCG mode'}"
         )
 
         # 2. Plan
@@ -45,9 +86,8 @@ class TekSession:
         for w in plan.warnings:
             print(f"  WARN: {w}")
         print(
-            f"  Guest → {plan.vcpu} vCPU | "
-            f"{plan.ram_mb} MB RAM | "
-            f"{plan.disk_gb:.1f} GB disk"
+            f"  Guest plan → {plan.vcpu} vCPU | "
+            f"{plan.ram_mb} MB RAM | {plan.disk_gb:.1f} GB disk"
         )
 
         # 3. Dependencies
@@ -65,58 +105,47 @@ class TekSession:
         qemu.start(self.iso_path, plan.vcpu, plan.ram_mb, vnc_pw)
         print("  QEMU started.")
 
-        # 6. Display bridge
+        # 6. Display bridge (idempotent)
         print("=== TEK: starting display bridge ===")
         display.start()
         print("  websockify ready on 127.0.0.1:6081.")
 
-        # 7. Auth proxy (placeholder descriptor until tunnel is up)
+        # 7. Auth proxy — starts NOT ready; mark_ready() called after tunnel
         print("=== TEK: starting auth proxy ===")
-        self._proxy = AuthProxy(
-            secret=self.secret,
-            session_id="pending",
-            descriptor_json="{}",
-            tunnel_host="",
-        )
+        self._proxy = AuthProxy(secret=self.secret)
         self._proxy.start()
 
-        # 8. Tunnel
+        # 8. Tunnel (idempotent — reuses existing URL if already up)
         print("=== TEK: opening Cloudflare tunnel ===")
         self.tunnel_url = tunnel.start()
         host = urlsplit(self.tunnel_url).hostname or ""
 
         # 9. Descriptor
-        plan_dict = plan.as_dict()
         self.session_id, self.descriptor_json = make_descriptor(
-            self.secret,
-            self.tunnel_url,
-            plan_dict,
+            self.secret, self.tunnel_url, plan.as_dict()
         )
 
-        # 10. Publish session credentials atomically.
-        # mark_ready() sets all three fields under a lock and then
-        # flips _ready=True, unblocking the auth endpoints.
+        # 10. Atomically publish — unblocks auth endpoints
         self._proxy.mark_ready(self.session_id, self.descriptor_json, host)
 
-        # 11. Print connection info — no secret, no token, no full descriptor
+        # 11. Print connection info (no secret, no token, no descriptor)
         nonce = pairing_nonce(self.secret)
         print()
         print("=" * 60)
         print("  TEK READY")
-        print(f"  host={host}")
-        print(f"  pair={nonce}")
+        print(f"  host = {host}")
+        print(f"  pair = {nonce}")
         print("=" * 60)
         print()
-        print("  In the controller:")
+        print("  In TEK Controller:")
         print(f"    1. Verify pair code matches: {nonce}")
-        print(f"    2. Enter tunnel host: {host}")
-        print("    3. Click 'Fetch & Connect'")
-        # NOTE: kickoff URL intentionally not printed.
-        # The token in the URL would enter browser history and Cloudflare logs.
-        # Use the TEK Controller to open the display securely.
+        print(f"    2. Tunnel host: {host}")
+        print("    3. Click 'Fetch & Connect' → 'Open Display'")
         print()
         print("=" * 60)
         print()
+
+    # ------------------------------------------------------------------ #
 
     def wait(self) -> None:
         try:
@@ -126,15 +155,34 @@ class TekSession:
                     break
                 time.sleep(15)
         except KeyboardInterrupt:
-            pass
+            print("\nTEK: interrupt received.")
         finally:
             self.stop()
 
     def stop(self) -> None:
-        print("=== TEK: stopping ===")
+        self._do_stop(quiet=False)
+
+    def _do_stop(self, quiet: bool = False) -> None:
+        global _active_session
+        if not quiet:
+            print("=== TEK: stopping ===")
         qemu.stop()
         display.stop()
         tunnel.stop()
         if self._proxy:
             self._proxy.stop()
-        print("=== TEK: stopped ===")
+            self._proxy = None
+        self._started = False
+        if _active_session is self:
+            _active_session = None
+        if not quiet:
+            print("=== TEK: stopped ===")
+
+
+def stop_active_session() -> None:
+    """Stop the currently running session from a notebook cell."""
+    global _active_session
+    if _active_session is not None:
+        _active_session.stop()
+    else:
+        print("No active TEK session.")

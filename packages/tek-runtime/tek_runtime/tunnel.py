@@ -1,4 +1,8 @@
-"""Cloudflare quick tunnel: start, parse URL, stop."""
+"""Cloudflare quick tunnel: start (idempotent), parse URL, stop.
+
+Idempotent: if the tunnel is already running and a URL is available in the
+log, start() returns the existing URL without launching a second cloudflared.
+"""
 from __future__ import annotations
 
 import os
@@ -6,7 +10,7 @@ import re
 import subprocess
 import time
 
-_LOG = "/tmp/tek-cloudflared.log"
+_LOG    = "/tmp/tek-cloudflared.log"
 _URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 _proc: subprocess.Popen | None = None
 
@@ -14,7 +18,7 @@ _proc: subprocess.Popen | None = None
 def _try_parse_log() -> str | None:
     try:
         txt = open(_LOG, errors="replace").read()
-        m = _URL_RE.search(txt)
+        m   = _URL_RE.search(txt)
         return m.group(0) if m else None
     except OSError:
         return None
@@ -35,7 +39,19 @@ def _launch(extra_args: list[str] | None = None) -> None:
 
 
 def start(timeout: int = 90) -> str:
-    """Start the tunnel and return its public HTTPS URL."""
+    """Start the tunnel and return its public HTTPS URL.
+
+    Idempotent: returns the existing URL if the tunnel is already up.
+    """
+    global _proc
+
+    # Reuse existing tunnel (same process)
+    if _proc is not None and _proc.poll() is None:
+        url = _try_parse_log()
+        if url:
+            print(f"  Tunnel already running: {url}")
+            return url
+
     _launch()
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -57,8 +73,8 @@ def start(timeout: int = 90) -> str:
             return url
 
     raise RuntimeError(
-        "TUNNEL_FAILED: Cloudflare tunnel did not produce a URL within "
-        f"{timeout * 2} s. Check network connectivity."
+        "TUNNEL_FAILED: Cloudflare tunnel did not produce a URL. "
+        "Check network connectivity and try again."
     )
 
 

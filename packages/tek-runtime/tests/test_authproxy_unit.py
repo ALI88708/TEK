@@ -416,3 +416,41 @@ class TestPipeE2E:
         proxy.stop()   # must close a and b, unblocking _pipe()
 
         assert done.wait(timeout=5), "proxy.stop() did not unblock the pipe within 5 s"
+
+
+# ======================================================================
+# Session idempotency
+# ======================================================================
+
+class TestSessionIdempotency:
+    def test_second_start_raises_session_already_running(self):
+        """UNIT: calling start() twice must raise SessionAlreadyRunning."""
+        import sys
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent.parent))
+        from tek_runtime.session import TekSession, SessionAlreadyRunning, _active_session
+        import tek_runtime.session as sess_mod
+
+        # Simulate a session already marked as started
+        fake = TekSession(iso_path=None, secret=generate_secret())
+        fake._started = True
+        sess_mod._active_session = fake
+
+        new_session = TekSession(iso_path=None, secret=generate_secret())
+        with pytest.raises(SessionAlreadyRunning):
+            new_session.start()
+
+        # Cleanup
+        sess_mod._active_session = None
+
+    def test_stop_clears_active_session(self):
+        """UNIT: _do_stop() clears _active_session."""
+        import sys
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent.parent))
+        import tek_runtime.session as sess_mod
+
+        fake = sess_mod.TekSession(iso_path=None, secret=generate_secret())
+        fake._started = True
+        sess_mod._active_session = fake
+
+        fake._do_stop(quiet=True)
+        assert sess_mod._active_session is None
