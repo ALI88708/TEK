@@ -1,29 +1,45 @@
 """Fetch and validate the session descriptor from the live runtime.
 
-Flow:
-  1. Derive descriptor_token from the secret.
-  2. GET https://<host>/tek/descriptor  Authorization: Bearer <token>
-  3. Parse descriptor, verify fingerprint.
-  4. Return the validated descriptor dict.
+Root causes of the original "Fetch & Connect hangs forever" bug:
 
-Error handling:
-  - ConnectError with stable code is raised on every failure path.
-  - Timeout: code=TIMEOUT, clear message so the UI shows something useful.
-  - 503 NOT_READY: runtime is still starting — caller should retry.
-  - Auth failure: code=AUTH_FAILED.
-  - Network unreachable: code=TUNNEL_FAILED.
+BUG A — Lambda closure (Python 3 exception scoping):
+  In Python 3, the exception variable `exc` in an `except` clause is deleted
+  when the clause exits.  The deferred lambda `lambda: self._on_fetch_error(exc)`
+  captures `exc` by name, but `exc` is gone by the time `root.after()` runs it,
+  causing a silent `NameError`.  Error callbacks never fire; the UI stays on
+  "Fetching…" indefinitely.
+  FIX: capture the exception before the except block exits:
+    `except ConnectError as exc: _e=exc; self.root.after(0, lambda e=_e: cb(e))`
+  (This fix lives in app.py where the lambda is built; connect.py documents it here.)
+
+BUG B — SSL ALPN / HTTP-version mismatch with Cloudflare:
+  Cloudflare Quick Tunnel (trycloudflare.com) advertises h2 (HTTP/2) during the
+  TLS ALPN handshake.  Python's `http.client` / `urllib.request` negotiates h2
+  but then sends an HTTP/1.1 request on the same socket.  Cloudflare waits ~2
+  minutes for the HTTP/2 connection preface before closing the connection.
+  FIX: build a custom ssl.SSLContext that restricts ALPN to ["http/1.1"] so
+  Cloudflare serves HTTP/1.1 on this connection.
+
+Connection phases (returned as ConnectError.code):
+  TIMEOUT          — socket-level timeout, no data received
+  TUNNEL_FAILED    — TCP/DNS failure, tunnel not reachable
+  NOT_READY        — 503, runtime still initialising
+  AUTH_FAILED      — 401 or fingerprint mismatch
+  DESCRIPTOR_ERROR — descriptor JSON invalid or expired
+  HTTP_ERROR       — other unexpected HTTP status
 """
 from __future__ import annotations
 
 import json
 import socket
+import ssl
 import urllib.error
 import urllib.request
 
 from .crypto import descriptor_token, fingerprint
 from .descriptor import DescriptorError, parse_descriptor
 
-_DEFAULT_TIMEOUT_S = 20
+_DEFAULT_TIMEOUT_S = 30
 
 
 class ConnectError(Exception):
@@ -33,6 +49,18 @@ class ConnectError(Exception):
         self.message = message
 
 
+def _make_ssl_context() -> ssl.SSLContext:
+    """Return an SSLContext that forces HTTP/1.1 ALPN.
+
+    Without this, Cloudflare Quick Tunnel negotiates h2 during TLS, but
+    Python's http.client speaks only HTTP/1.1 on the wire.  Cloudflare then
+    waits ~2 min for the HTTP/2 preface before timing out.
+    """
+    ctx = ssl.create_default_context()
+    ctx.set_alpn_protocols(["http/1.1"])
+    return ctx
+
+
 def fetch_descriptor(
     secret: bytes,
     host: str,
@@ -40,19 +68,35 @@ def fetch_descriptor(
     verify_expiry: bool = True,
     timeout_s: int = _DEFAULT_TIMEOUT_S,
 ) -> dict:
-    """Fetch the descriptor and return the validated dict.
+    """Fetch the session descriptor from the runtime and validate it.
 
-    Raises ConnectError on any failure.
+    Phases and their ConnectError codes:
+      1. DNS + TCP connect         → TUNNEL_FAILED
+      2. TLS handshake             → TUNNEL_FAILED (SSL error)
+      3. HTTP GET /tek/descriptor  → TIMEOUT / AUTH_FAILED / NOT_READY / HTTP_ERROR
+      4. Parse + validate          → DESCRIPTOR_ERROR / AUTH_FAILED
     """
     token = descriptor_token(secret)
     url   = f"https://{host}/tek/descriptor"
 
     req = urllib.request.Request(
         url,
-        headers={"Authorization": f"Bearer {token}"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            # Explicitly request HTTP/1.1 keep-alive semantics.
+            # Cloudflare respects Connection: close and won't reuse the socket.
+            "Connection":    "close",
+        },
     )
+
+    # Custom opener forces HTTP/1.1 ALPN — fixes BUG B.
+    ssl_ctx = _make_ssl_context()
+    opener  = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ssl_ctx)
+    )
+
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with opener.open(req, timeout=timeout_s) as resp:
             raw = resp.read().decode()
 
     except socket.timeout:
@@ -60,6 +104,18 @@ def fetch_descriptor(
             "TIMEOUT",
             f"The runtime did not respond within {timeout_s} s. "
             "The tunnel may still be starting — wait 10 seconds and retry.",
+        )
+    except TimeoutError:
+        # On Python 3.11+, socket.timeout is an alias for TimeoutError
+        raise ConnectError(
+            "TIMEOUT",
+            f"Connection timed out after {timeout_s} s. Try again in a moment.",
+        )
+    except ssl.SSLError as exc:
+        raise ConnectError(
+            "TUNNEL_FAILED",
+            f"TLS error connecting to {host}: {exc.reason}. "
+            "Check that the tunnel hostname is correct.",
         )
     except urllib.error.HTTPError as exc:
         body, code = "", "HTTP_ERROR"
@@ -71,34 +127,47 @@ def fetch_descriptor(
         if exc.code == 503:
             raise ConnectError(
                 "NOT_READY",
-                "Runtime is still initializing. Wait a few seconds and retry.",
+                "Runtime is still initializing (503). "
+                "Wait a few seconds and retry.",
             )
         if exc.code == 401:
             raise ConnectError(
                 "AUTH_FAILED",
-                "Authentication failed. Ensure the secret matches TEK_SESSION_SECRET.",
+                "Authentication failed (401). "
+                "Ensure the secret in the controller matches TEK_SESSION_SECRET "
+                "set in the Kaggle notebook.",
             )
-        raise ConnectError(code, f"HTTP {exc.code}: {body[:200]}") from exc
+        raise ConnectError(code, f"HTTP {exc.code}: {body[:300]}") from exc
 
     except urllib.error.URLError as exc:
+        reason = str(exc.reason)
         raise ConnectError(
             "TUNNEL_FAILED",
-            f"Could not reach {host}. "
-            "Check that the tunnel hostname is correct and the runtime is running. "
-            f"Detail: {exc.reason}",
+            f"Could not reach {host}: {reason}. "
+            "Verify the tunnel hostname and that the Kaggle notebook is running.",
         ) from exc
 
+    except OSError as exc:
+        raise ConnectError(
+            "TUNNEL_FAILED",
+            f"Network error: {exc}.",
+        ) from exc
+
+    # Parse and validate the descriptor
     try:
         desc = parse_descriptor(raw, check_expiry=verify_expiry)
     except DescriptorError as exc:
-        raise ConnectError(exc.code, str(exc)) from exc
+        raise ConnectError("DESCRIPTOR_ERROR", str(exc)) from exc
 
+    # Verify that the runtime is using the same secret
     expected_fp = fingerprint(secret)
-    if desc.get("secret_fingerprint") != expected_fp:
+    actual_fp   = desc.get("secret_fingerprint", "")
+    if actual_fp != expected_fp:
         raise ConnectError(
             "AUTH_FAILED",
             "Secret fingerprint mismatch. "
-            "The runtime is not using the same session secret.",
+            "The runtime is not using the same TEK_SESSION_SECRET. "
+            f"Expected {expected_fp}, got {actual_fp}.",
         )
 
     return desc

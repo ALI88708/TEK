@@ -358,10 +358,18 @@ class TekControllerApp:
             self.session.transition(SessionState.PREPARING, "fetch requested")
             self.session.transition(SessionState.CONNECTING, "fetching descriptor")
         self._sync_status()
-        self.connection_view.set_status("Fetching descriptor from runtime…")
+        self.connection_view.set_status(
+            "CONNECTING → Reaching tunnel host…", code="CONNECTING_TO_TUNNEL"
+        )
         self.dashboard.log(f"Fetching descriptor from {host}…")
 
         def _fetch() -> None:
+            # Phase 1: connecting to tunnel
+            def _phase(msg: str, code: str) -> None:
+                self.root.after(0, lambda m=msg, c=code:
+                    self.connection_view.set_status(m, code=c))
+
+            _phase("AUTHENTICATING → Requesting descriptor…", "AUTHENTICATING")
             try:
                 desc_dict = fetch_descriptor(
                     secret, host,
@@ -369,7 +377,11 @@ class TekControllerApp:
                     timeout_s=self.settings.connect_timeout_s,
                 )
             except ConnectError as exc:
-                self.root.after(0, lambda: self._on_fetch_error(exc))
+                # BUG A FIX: Python 3 deletes `exc` when the except block
+                # exits, so a plain `lambda: cb(exc)` raises NameError.
+                # Capture it in the default argument before the block exits.
+                _exc = exc
+                self.root.after(0, lambda e=_exc: self._on_fetch_error(e))
                 return
             self.root.after(0, lambda: self._on_fetch_ok(secret, host, desc_dict))
 
