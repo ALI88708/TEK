@@ -18,6 +18,7 @@ import time
 from urllib.parse import urlsplit
 
 from . import deps, display, fetch_iso, qemu, tunnel
+from .watchdog import ProcessWatchdog, ServiceConfig, RestartPolicy
 from .guest_config import GuestConfig
 from .authproxy import AuthProxy
 from .control import make_descriptor
@@ -55,6 +56,7 @@ class TekSession:
         self._proxy: AuthProxy | None = None
         self._stop = threading.Event()
         self._started = False
+        self._watchdog: 'ProcessWatchdog | None' = None
 
     # ------------------------------------------------------------------ #
 
@@ -146,6 +148,11 @@ class TekSession:
         # 10. Atomically publish — unblocks auth endpoints
         self._proxy.mark_ready(self.session_id, self.descriptor_json, host)
 
+        # 11. Start watchdog
+        self._watchdog = self._build_watchdog()
+        self._watchdog.start()
+        print("  Watchdog active.")
+
         # 11. Print connection info (no secret, no token, no descriptor)
         nonce = pairing_nonce(self.secret)
         print()
@@ -164,6 +171,41 @@ class TekSession:
         print()
 
     # ------------------------------------------------------------------ #
+
+    def _build_watchdog(self) -> ProcessWatchdog:
+        def _on_dead(name: str) -> None:
+            print(f"[Watchdog] {name} is DEAD — initiating session shutdown.")
+            self._stop.set()
+
+        wd = ProcessWatchdog(check_interval_s=15, on_dead=_on_dead)
+
+        # QEMU: NEVER restart — would kill the guest OS
+        wd.register(ServiceConfig(
+            name="qemu",
+            is_alive=qemu.is_alive,
+            start_fn=lambda: None,  # unused
+            policy=RestartPolicy.NEVER,
+        ))
+
+        # Display bridge: restart on failure
+        wd.register(ServiceConfig(
+            name="display",
+            is_alive=display._port_open,
+            start_fn=display.start,
+            policy=RestartPolicy.ON_FAILURE,
+            max_restarts=3,
+        ))
+
+        # Tunnel: restart on failure
+        wd.register(ServiceConfig(
+            name="tunnel",
+            is_alive=lambda: tunnel._proc is not None and tunnel._proc.poll() is None,
+            start_fn=lambda: setattr(self, 'tunnel_url', tunnel.start()),
+            policy=RestartPolicy.ON_FAILURE,
+            max_restarts=5,
+        ))
+
+        return wd
 
     def wait(self) -> None:
         try:
@@ -184,6 +226,9 @@ class TekSession:
         global _active_session
         if not quiet:
             print("=== TEK: stopping ===")
+        if self._watchdog:
+            self._watchdog.stop()
+            self._watchdog = None
         qemu.stop()
         display.stop()
         tunnel.stop()

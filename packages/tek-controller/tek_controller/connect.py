@@ -177,3 +177,47 @@ def build_kickoff_url(secret: bytes, host: str) -> str:
     """URL that sets the session cookie and redirects to /vnc.html."""
     from .crypto import kickoff_token as _kt
     return f"https://{host}/tek/kickoff?t={_kt(secret)}"
+
+
+def fetch_with_retry(
+    secret: bytes,
+    host: str,
+    *,
+    verify_expiry: bool = True,
+    timeout_s: int = _DEFAULT_TIMEOUT_S,
+    max_attempts: int = 5,
+    base_backoff_s: float = 3.0,
+    on_attempt: "Callable[[int, str], None] | None" = None,
+) -> dict:
+    """Retry fetch_descriptor with exponential backoff.
+
+    Retries on TIMEOUT and NOT_READY (retryable errors).
+    Raises immediately on AUTH_FAILED or DESCRIPTOR_ERROR (permanent errors).
+
+    Parameters
+    ----------
+    on_attempt   Called with (attempt_number, status_message) before each retry.
+    """
+    from typing import Callable
+    _RETRYABLE = {"TIMEOUT", "NOT_READY", "TUNNEL_FAILED"}
+    last_exc: ConnectError | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        if on_attempt:
+            on_attempt(attempt, f"Attempt {attempt}/{max_attempts}…")
+        try:
+            return fetch_descriptor(secret, host,
+                                    verify_expiry=verify_expiry,
+                                    timeout_s=timeout_s)
+        except ConnectError as exc:
+            last_exc = exc
+            if exc.code not in _RETRYABLE:
+                raise  # permanent failure — do not retry
+            if attempt < max_attempts:
+                wait = min(base_backoff_s * (2 ** (attempt - 1)), 30.0)
+                if on_attempt:
+                    on_attempt(attempt, f"{exc.code}: {exc.message[:60]}… retrying in {wait:.0f}s")
+                import time as _t
+                _t.sleep(wait)
+
+    raise last_exc  # type: ignore[misc]

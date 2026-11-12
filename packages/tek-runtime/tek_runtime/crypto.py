@@ -138,3 +138,8 @@ def verify_descriptor_token(secret: bytes, token: str) -> bool:
 
 def verify_kickoff_token(secret: bytes, token: str) -> bool:
     return _hmac.compare_digest(token, kickoff_token(secret))
+
+
+def relay_token(secret: bytes) -> str:
+    """frp authentication token derived from session secret."""
+    return b64url_encode(_hkdf_sha256(secret, _SALT, b"tek/v0/relay", 32))

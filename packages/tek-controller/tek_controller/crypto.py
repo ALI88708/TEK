@@ -70,3 +70,8 @@ def fingerprint(secret: bytes) -> str:
 
 def pairing_nonce(secret: bytes) -> str:
     return _b64url(_hkdf_sha256(secret, _SALT, b"tek/v0/pair", 4))[:6]
+
+
+def relay_token(secret: bytes) -> str:
+    """frp authentication token derived from session secret."""
+    return _b64url(_hkdf_sha256(secret, _SALT, b"tek/v0/relay", 32))

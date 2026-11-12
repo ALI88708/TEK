@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import time as _time
 from .crypto import (
     make_cookie_value,
     verify_auth_token,
@@ -167,6 +168,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/tek/descriptor":
             self._handle_descriptor()
+        elif path == "/tek/health":
+            self._handle_health()
         elif path == "/tek/kickoff":
             qs = parse_qs(parsed.query)
             self._handle_kickoff(qs.get("t", [""])[0])
@@ -210,6 +213,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ #
     # Endpoints                                                            #
     # ------------------------------------------------------------------ #
+
+    def _handle_health(self) -> None:
+        """Public health check — no authentication required.
+        Returns 200 if the proxy is running (session may still be initializing).
+        Returns 503 if the proxy is not yet ready to serve authenticated requests.
+        """
+        ready, sid, _, _ = self.proxy.state.snapshot()
+        body = json.dumps({
+            "status": "ready" if ready else "initializing",
+            "session_ready": ready,
+            "time": _time.time(),
+        }).encode()
+        code = 200 if ready else 503
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_descriptor(self) -> None:
         if not self._session_ready():
