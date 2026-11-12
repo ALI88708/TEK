@@ -98,8 +98,23 @@ def start(
     ram_mb: int,
     vnc_password: str,
     disk_path: str | None = None,
+    machine: str = "pc",
+    boot_order: str = "d",
+    extra_args: list | None = None,
 ) -> None:
-    """Start QEMU as a tracked child process. Raises if already running."""
+    """Start QEMU as a tracked child process. Raises if already running.
+
+    Parameters
+    ----------
+    iso_path    Path to the CD-ROM ISO.
+    vcpu        Number of virtual CPUs.
+    ram_mb      Guest RAM in megabytes.
+    vnc_password  VNC password (derived from session secret; never logged).
+    disk_path   Optional path to a QCOW2 persistent disk image.
+    machine     QEMU -machine type. "pc" (default) or "q35" (Windows).
+    boot_order  QEMU boot order. "d" = CD-ROM first.
+    extra_args  Additional raw QEMU arguments (from GuestConfig.extra_qemu_args).
+    """
     global _proc, _log_fd
 
     if _proc is not None and _proc.poll() is None:
@@ -110,19 +125,23 @@ def start(
 
     cmd = [
         "qemu-system-x86_64",
-        "-accel", "tcg,thread=multi",
-        "-cpu",   "max",
-        "-smp",   str(vcpu),
-        "-m",     str(ram_mb),
-        "-cdrom", iso_path,
-        "-boot",  "d",
-        "-vga",   "std",
-        "-vnc",   "127.0.0.1:0,password=on",
+        "-accel",   "tcg,thread=multi",
+        "-cpu",     "max",
+        "-machine", machine,
+        "-smp",     str(vcpu),
+        "-m",       str(ram_mb),
+        "-cdrom",   iso_path,
+        "-boot",    boot_order,
+        "-vga",     "std",
+        # :0,to=10 lets QEMU find a free port in 5900–5910 if 5900 is taken
+        "-vnc",     "127.0.0.1:0,to=10,password=on",
         "-monitor", f"unix:{_MON_SOCK},server,nowait",
         # No -daemonize: keep the Popen handle for safe shutdown.
     ]
     if disk_path:
         cmd += ["-drive", f"file={disk_path},format=qcow2,if=virtio"]
+    if extra_args:
+        cmd += extra_args
 
     # Open log file before Popen so we can close it if Popen raises.
     _log_fd = open(_QEMU_LOG, "w")

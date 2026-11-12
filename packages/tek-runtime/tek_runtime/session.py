@@ -18,6 +18,7 @@ import time
 from urllib.parse import urlsplit
 
 from . import deps, display, fetch_iso, qemu, tunnel
+from .guest_config import GuestConfig
 from .authproxy import AuthProxy
 from .control import make_descriptor
 from .crypto import (
@@ -38,9 +39,16 @@ _active_session: "TekSession | None" = None
 
 
 class TekSession:
-    def __init__(self, iso_path: str | None, secret: bytes) -> None:
-        self.iso_path         = iso_path
+    def __init__(
+        self,
+        secret: bytes,
+        iso_path: str | None = None,
+        guest: GuestConfig | None = None,
+    ) -> None:
+        # guest takes precedence over bare iso_path
         self.secret           = secret
+        self._guest           = guest
+        self.iso_path         = guest.iso_path if guest else iso_path
         self.session_id:  str = ""
         self.tunnel_url:  str = ""
         self.descriptor_json: str = ""
@@ -102,7 +110,17 @@ class TekSession:
         # 5. QEMU
         print("=== TEK: starting QEMU ===")
         vnc_pw = vnc_password(self.secret)
-        qemu.start(self.iso_path, plan.vcpu, plan.ram_mb, vnc_pw)
+        g = self._guest
+        qemu.start(
+            self.iso_path,
+            plan.vcpu,
+            plan.ram_mb,
+            vnc_pw,
+            disk_path=g.disk_path if g else None,
+            machine=g.machine if g else "pc",
+            boot_order=g.boot_order if g else "d",
+            extra_args=g.extra_qemu_args if g else None,
+        )
         print("  QEMU started.")
 
         # 6. Display bridge (idempotent)
