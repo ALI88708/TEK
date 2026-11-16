@@ -75,3 +75,20 @@ def pairing_nonce(secret: bytes) -> str:
 def relay_token(secret: bytes) -> str:
     """frp authentication token derived from session secret."""
     return _b64url(_hkdf_sha256(secret, _SALT, b"tek/v0/relay", 32))
+
+
+# ---------- cookie -------------------------------------------------------
+
+_COOKIE_SIG_LEN = 16  # hex characters of HMAC-SHA256, mirrors runtime/crypto.py
+
+
+def make_cookie_value(secret: bytes, session_id: str, expiry_unix: int) -> str:
+    """Mint the ``tek_session`` cookie value the runtime will accept.
+
+    The cookie is stateless: ``<expiry>.<session_id>.<hmac>``. The runtime
+    only ever issues it to a browser, so the controller derives its own copy
+    instead of scraping one out of a redirect.
+    """
+    msg = f"{expiry_unix}:{session_id}".encode()
+    sig = _hmac.new(secret, msg, hashlib.sha256).hexdigest()[:_COOKIE_SIG_LEN]
+    return f"{expiry_unix}.{session_id}.{sig}"

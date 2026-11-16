@@ -32,6 +32,8 @@ class DashboardView(tk.Frame):
         on_open_terminal: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master, bg=P["bg"])
+        self._on_open_vnc = on_open_vnc
+        self._on_open_terminal = on_open_terminal
         self.columnconfigure(0, weight=1)
         self.columnconfigure(1, weight=0, minsize=372)
         self.rowconfigure(0, weight=1)
@@ -47,7 +49,9 @@ class DashboardView(tk.Frame):
 
         self._build_display(left)
         self._build_log(left)
-        self._build_session_card(right, on_create, on_open_connection)
+        self._build_session_card(
+            right, on_create, on_open_connection, on_open_vnc, on_open_terminal
+        )
         self._build_runtime_card(right)
 
     # -- construction ----------------------------------------------------
@@ -159,12 +163,12 @@ class DashboardView(tk.Frame):
         ).pack(fill="x", pady=(6, 0))
         ActionButton(
             card.body,"Open VNC",
-            lambda:self._on_open_vnc and self._on_open_vnc(),
+            lambda:on_open_vnc and on_open_vnc(),
             variant="secondary"
         ).pack(fill="x",pady=(4,0))
         ActionButton(
             card.body,"Open Terminal",
-            lambda:self._on_open_terminal and self._on_open_terminal(),
+            lambda:on_open_terminal and on_open_terminal(),
             variant="secondary"
         ).pack(fill="x",pady=(4,0))
 

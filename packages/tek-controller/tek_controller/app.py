@@ -9,6 +9,7 @@ Changes from the prototype build:
 from __future__ import annotations
 
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
@@ -21,7 +22,7 @@ from tek_controller.connect import (
 from tek_controller.views.control_panel import ControlPanelView
 from tek_controller.views.vnc_window import VncWindow
 from tek_controller.views.terminal_window import TerminalWindow
-from tek_controller.crypto import generate_secret, pairing_nonce
+from tek_controller.crypto import generate_secret, make_cookie_value, pairing_nonce
 from tek_controller.descriptor import (
     DescriptorError,
     SessionDescriptor,
@@ -43,6 +44,8 @@ from tek_controller.widgets.primitives import StatusPill
 from tek_controller.widgets.sidebar import Sidebar
 
 P = theme.PALETTE
+
+COOKIE_TTL_S = 900  # mirrors runtime/authproxy.py _COOKIE_TTL
 
 VIEW_META: dict[str, tuple[str, str]] = {
     "dashboard": (
@@ -433,6 +436,7 @@ class TekControllerApp:
         self._live_descriptor_dict = desc_dict
         self._live_secret = secret
         self._live_host = host
+        self._live_session_id = parsed.session_id
         self.descriptor = parsed
 
         width, height = parsed.display.geometry
@@ -458,7 +462,6 @@ class TekControllerApp:
         self.dashboard.set_notice(
             f"Connected to {host}.\nSession: {parsed.session_id}"
         )
-        self._session_cookie = getattr(self,"_session_cookie","")
         try: self.control_panel_view.start_polling()
         except Exception: pass
         # Advance from CONNECTING → RUNNING
@@ -484,9 +487,24 @@ class TekControllerApp:
 
     # -- live metrics -------------------------------------------------------
 
+    def _session_cookie_value(self) -> str:
+        """Mint a fresh ``tek_session`` cookie for the live session.
+
+        The cookie is stateless and the runtime only hands one to a browser,
+        so the controller derives its own. Minting per call keeps the 15-minute
+        TTL from silently expiring the control panel and the terminal.
+        """
+        secret = getattr(self, "_live_secret", None)
+        session_id = getattr(self, "_live_session_id", "")
+        if not secret or not session_id:
+            return ""
+        return make_cookie_value(
+            secret, session_id, int(time.time()) + COOKIE_TTL_S
+        )
+
     def _fetch_live_metrics(self) -> dict | None:
         host   = getattr(self,'_live_host',None)
-        cookie = getattr(self,'_session_cookie','')
+        cookie = self._session_cookie_value()
         if not host or not cookie: return None
         try:
             return fetch_metrics(
@@ -509,7 +527,7 @@ class TekControllerApp:
 
     def open_terminal_window(self) -> None:
         host   = getattr(self,'_live_host',None)
-        cookie = getattr(self,'_session_cookie','')
+        cookie = self._session_cookie_value()
         if not host:
             self.dashboard.log('No active session — connect first.')
             return
