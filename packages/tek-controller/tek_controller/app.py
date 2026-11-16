@@ -15,7 +15,12 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from tek_controller import theme
-from tek_controller.connect import ConnectError, build_kickoff_url, fetch_descriptor
+from tek_controller.connect import (
+    ConnectError, build_kickoff_url, fetch_descriptor, fetch_metrics,
+)
+from tek_controller.views.control_panel import ControlPanelView
+from tek_controller.views.vnc_window import VncWindow
+from tek_controller.views.terminal_window import TerminalWindow
 from tek_controller.crypto import generate_secret, pairing_nonce
 from tek_controller.descriptor import (
     DescriptorError,
@@ -47,6 +52,10 @@ VIEW_META: dict[str, tuple[str, str]] = {
     "connection": (
         "Connection",
         "Connect to a live runtime or validate a descriptor manually.",
+    ),
+    "control_panel": (
+        "Control Panel",
+        "Live CPU, RAM, Disk and process metrics from Kaggle.",
     ),
     "settings": (
         "Settings",
@@ -211,6 +220,7 @@ class TekControllerApp:
                 ("01", "dashboard", "Session"),
                 ("02", "connection", "Connection"),
                 ("03", "settings", "Settings"),
+                ("04", "control_panel", "Control Panel"),
             ),
             self.show_view,
         )
@@ -262,6 +272,8 @@ class TekControllerApp:
             self.container,
             on_create=self.create_session,
             on_open_connection=lambda: self.show_view("connection"),
+            on_open_vnc=self.open_vnc_window,
+            on_open_terminal=self.open_terminal_window,
         )
         self.connection_view = ConnectionView(
             self.container,
@@ -278,10 +290,14 @@ class TekControllerApp:
             on_restore=self.restore_default_preferences,
         )
 
+        self.control_panel_view = ControlPanelView(
+            self.container, on_refresh=self._fetch_live_metrics,
+        )
         self.views: dict[str, tk.Frame] = {
             "dashboard": self.dashboard,
             "connection": self.connection_view,
             "settings": self.settings_view,
+            "control_panel": self.control_panel_view,
         }
         for view in self.views.values():
             view.grid(row=0, column=0, sticky="nsew")
@@ -442,6 +458,9 @@ class TekControllerApp:
         self.dashboard.set_notice(
             f"Connected to {host}.\nSession: {parsed.session_id}"
         )
+        self._session_cookie = getattr(self,"_session_cookie","")
+        try: self.control_panel_view.start_polling()
+        except Exception: pass
         # Advance from CONNECTING → RUNNING
         if self.session.state is SessionState.CONNECTING:
             self.session.bind_session(parsed.session_id)
@@ -462,6 +481,43 @@ class TekControllerApp:
         url = build_kickoff_url(secret, host)
         webbrowser.open(url)
         self.dashboard.log(f"Opened display in browser for host {host}.")
+
+    # -- live metrics -------------------------------------------------------
+
+    def _fetch_live_metrics(self) -> dict | None:
+        host   = getattr(self,'_live_host',None)
+        cookie = getattr(self,'_session_cookie','')
+        if not host or not cookie: return None
+        try:
+            return fetch_metrics(
+                self.secret, host, cookie,
+                timeout_s=self.settings.connect_timeout_s,
+            )
+        except Exception: return None
+
+    # -- VNC / Terminal windows -------------------------------------------
+
+    def open_vnc_window(self) -> None:
+        host   = getattr(self,'_live_host',None)
+        secret = getattr(self,'_live_secret',None)
+        if not host or not secret:
+            self.dashboard.log('No active session — connect first.')
+            return
+        kurl = build_kickoff_url(secret, host)
+        VncWindow(self.root, tunnel_host=host, kickoff_url=kurl).focus_set()
+        self.dashboard.log(f'VNC window opened for {host}.')
+
+    def open_terminal_window(self) -> None:
+        host   = getattr(self,'_live_host',None)
+        cookie = getattr(self,'_session_cookie','')
+        if not host:
+            self.dashboard.log('No active session — connect first.')
+            return
+        if not cookie:
+            self.dashboard.log('Fetch & Connect first to get a session cookie.')
+            return
+        TerminalWindow(self.root, tunnel_host=host, session_cookie=cookie).focus_set()
+        self.dashboard.log(f'Terminal window opened for {host}.')
 
     # -- session actions (dashboard) ------------------------------------
 
@@ -582,6 +638,10 @@ class TekControllerApp:
 
     def _sync_status(self) -> None:
         self.status_pill.set_state(self.session.state)
+
+    @property
+    def secret(self) -> bytes | None:
+        return getattr(self,"_live_secret",None)
 
     def _log_startup(self) -> None:
         self.dashboard.log("Controller started.")

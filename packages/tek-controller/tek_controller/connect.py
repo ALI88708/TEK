@@ -221,3 +221,23 @@ def fetch_with_retry(
                 _t.sleep(wait)
 
     raise last_exc  # type: ignore[misc]
+
+
+def fetch_metrics(secret: bytes, host: str, session_cookie: str, *, timeout_s: int = 8) -> dict:
+    """Fetch live host metrics from /tek/metrics."""
+    ssl_ctx = _make_ssl_context()
+    opener  = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl_ctx))
+    req = urllib.request.Request(
+        f"https://{host}/tek/metrics",
+        headers={"Cookie": f"tek_session={session_cookie}", "Connection": "close"},
+    )
+    try:
+        import json as _j
+        with opener.open(req, timeout=timeout_s) as r:
+            return _j.loads(r.read().decode())
+    except socket.timeout:
+        raise ConnectError("TIMEOUT","Metrics request timed out.")
+    except urllib.error.HTTPError as exc:
+        raise ConnectError("HTTP_ERROR",f"HTTP {exc.code}")
+    except urllib.error.URLError as exc:
+        raise ConnectError("TUNNEL_FAILED",str(exc.reason))

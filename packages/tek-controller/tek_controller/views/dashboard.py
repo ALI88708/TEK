@@ -28,6 +28,8 @@ class DashboardView(tk.Frame):
         *,
         on_create: Callable[[], None],
         on_open_connection: Callable[[], None],
+        on_open_vnc: Callable[[], None] | None = None,
+        on_open_terminal: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master, bg=P["bg"])
         self.columnconfigure(0, weight=1)
@@ -100,6 +102,8 @@ class DashboardView(tk.Frame):
         master: tk.Misc,
         on_create: Callable[[], None],
         on_open_connection: Callable[[], None],
+        on_open_vnc: Callable[[], None] | None = None,
+        on_open_terminal: Callable[[], None] | None = None,
     ) -> None:
         card = Card(master, padding=16)
         card.grid(row=0, column=0, sticky="new")
@@ -153,6 +157,16 @@ class DashboardView(tk.Frame):
         ActionButton(
             card.body, "Open Connection", on_open_connection, variant="secondary"
         ).pack(fill="x", pady=(6, 0))
+        ActionButton(
+            card.body,"Open VNC",
+            lambda:self._on_open_vnc and self._on_open_vnc(),
+            variant="secondary"
+        ).pack(fill="x",pady=(4,0))
+        ActionButton(
+            card.body,"Open Terminal",
+            lambda:self._on_open_terminal and self._on_open_terminal(),
+            variant="secondary"
+        ).pack(fill="x",pady=(4,0))
 
         self.notice_label = tk.Label(
             card.body,

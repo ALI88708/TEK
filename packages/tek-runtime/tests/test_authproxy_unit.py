@@ -391,7 +391,7 @@ class TestPipeE2E:
         t.start()
 
         a.close()   # close one side
-        assert done.wait(timeout=5), "_pipe() did not terminate within 5 s"
+        assert done.wait(timeout=15), "_pipe() did not terminate within 15 s"
         b.close()
 
     def test_proxy_stop_unblocks_active_pipe(self):

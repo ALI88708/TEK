@@ -38,7 +38,9 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import subprocess as _subproc
 import time as _time
+import threading as _threading
 from .crypto import (
     make_cookie_value,
     verify_auth_token,
@@ -170,6 +172,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._handle_descriptor()
         elif path == "/tek/health":
             self._handle_health()
+        elif path == "/tek/metrics":
+            self._handle_metrics()
+        elif path == "/tek/terminal":
+            if self.headers.get("Upgrade","").lower()=="websocket":
+                self._handle_terminal_upgrade()
+            else:
+                self._json(400,"BAD_REQUEST","WebSocket upgrade required.")
         elif path == "/tek/kickoff":
             qs = parse_qs(parsed.query)
             self._handle_kickoff(qs.get("t", [""])[0])
@@ -232,6 +241,88 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _handle_metrics(self) -> None:
+        """Live host metrics — requires session cookie."""
+        if not self._session_ready():
+            return
+        _, sid, _, _ = self.proxy.state.snapshot()
+        cookie = self._get_cookie(_COOKIE_NAME)
+        if not cookie or not verify_cookie_value(self.proxy.secret, sid, cookie):
+            self._json(401, "AUTH_REQUIRED", "Session cookie required.")
+            return
+        try:
+            from .metrics import snapshot
+            body = json.dumps(snapshot()).encode()
+        except Exception as exc:
+            self._json(500, "METRICS_ERROR", str(exc)[:200])
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_terminal_upgrade(self) -> None:
+        """WebSocket terminal — bash on Kaggle host."""
+        if not self._session_ready():
+            return
+        if not self._check_origin():
+            self.send_response(403); self.end_headers(); return
+        _, sid, _, _ = self.proxy.state.snapshot()
+        cookie = self._get_cookie(_COOKIE_NAME)
+        if not cookie or not verify_cookie_value(self.proxy.secret, sid, cookie):
+            self.send_response(401); self.send_header("WWW-Authenticate","cookie")
+            self.end_headers(); return
+        import hashlib, base64
+        ws_key = self.headers.get("Sec-WebSocket-Key","")
+        accept = base64.b64encode(hashlib.sha1(
+            (ws_key+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        self.send_response(101)
+        self.send_header("Upgrade","websocket")
+        self.send_header("Connection","Upgrade")
+        self.send_header("Sec-WebSocket-Accept",accept)
+        self.end_headers(); self.wfile.flush()
+        proc = _subproc.Popen(["/bin/bash","--norc","--noprofile"],
+            stdin=_subproc.PIPE, stdout=_subproc.PIPE, stderr=_subproc.STDOUT)
+        sock = self.connection
+        self.proxy._register_pipe(sock, sock)
+        def _send_ws(data):
+            try:
+                n=len(data)
+                hdr=(bytes([0x81,n]) if n<126 else bytes([0x81,126])+n.to_bytes(2,'big'))
+                sock.sendall(hdr+data)
+            except OSError: pass
+        def _out_to_ws():
+            try:
+                for ln in iter(proc.stdout.readline,b''):
+                    if not ln: break
+                    _send_ws(ln)
+            except Exception: pass
+            proc.terminate()
+            try: sock.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+        _threading.Thread(target=_out_to_ws,daemon=True).start()
+        try:
+            while True:
+                hdr=sock.recv(2)
+                if len(hdr)<2: break
+                opc=hdr[0]&0x0F
+                if opc==0x8: break
+                masked=bool(hdr[1]&0x80); plen=hdr[1]&0x7F
+                if plen==126: plen=int.from_bytes(sock.recv(2),'big')
+                elif plen==127: plen=int.from_bytes(sock.recv(8),'big')
+                mask=sock.recv(4) if masked else b'\x00\x00\x00\x00'
+                payload=bytearray(sock.recv(plen))
+                if masked:
+                    for i in range(len(payload)): payload[i]^=mask[i%4]
+                if opc in(0x1,0x2):
+                    proc.stdin.write(bytes(payload)); proc.stdin.flush()
+        except Exception: pass
+        finally:
+            proc.terminate()
+            self.proxy._unregister_pipe(sock)
 
     def _handle_descriptor(self) -> None:
         if not self._session_ready():
