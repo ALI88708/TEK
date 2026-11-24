@@ -1,6 +1,6 @@
 """Control Panel — live metrics from Kaggle Runtime Host."""
 from __future__ import annotations
-import threading, time, tkinter as tk
+import queue, threading, time, tkinter as tk
 from collections.abc import Callable
 from tek_controller import theme
 P = theme.PALETTE
@@ -25,6 +25,8 @@ class ControlPanelView(tk.Frame):
         super().__init__(master,bg=P["bg"])
         self._on_refresh=on_refresh
         self._job=None
+        self._drain_job=None
+        self._results: queue.Queue = queue.Queue()   # worker thread -> Tk thread
         self._build()
     def _build(self):
         self.columnconfigure((0,1,2),weight=1)
@@ -49,16 +51,28 @@ class ControlPanelView(tk.Frame):
         self._procs=tk.Label(pf,text="—",bg=P["surface"],fg=P["text"],
                              font=theme.fonts().mono_font(9),anchor="w",justify="left")
         self._procs.pack(fill="x",padx=10,pady=(0,8))
-    def start_polling(self):  self._do_refresh()
+    def start_polling(self):
+        if self._job is not None:           # already polling (e.g. reconnect): keep the single loop
+            return
+        self._drain()
+        self._do_refresh()
     def stop_polling(self):
-        if self._job: self.after_cancel(self._job); self._job=None
+        for attr in ("_job", "_drain_job"):
+            job = getattr(self, attr)
+            if job:
+                self.after_cancel(job); setattr(self, attr, None)
     def _do_refresh(self):
         def _f():
             try: data=self._on_refresh()
             except Exception: data=None
-            self.after(0,lambda d=data:self._update(d))
+            self._results.put(data)         # never touch Tk from the worker thread
         threading.Thread(target=_f,daemon=True).start()
         self._job=self.after(self.REFRESH_MS,self._do_refresh)
+    def _drain(self):
+        try:
+            while True: self._update(self._results.get_nowait())
+        except queue.Empty: pass
+        self._drain_job=self.after(200,self._drain)
     def _update(self,data):
         ts=time.strftime("%H:%M:%S")
         c=self._cards

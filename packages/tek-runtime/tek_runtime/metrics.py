@@ -65,14 +65,12 @@ def qemu_status() -> dict:
     return {"running":_q.is_alive(),"pid":_q.pid()}
 
 def process_list() -> list[dict]:
-    procs=[]
-    for name in ("qemu-system-x86_64","websockify","cloudflared"):
-        try:
-            r=_sp.run(["pgrep","-x",name],capture_output=True,text=True)
-            procs.append({"name":name,"running":r.returncode==0})
-        except Exception:
-            procs.append({"name":name,"running":False})
-    return procs
+    from .procs import pids_by_name
+    return [
+        {"name": n, "running": bool(pids_by_name(n))}
+        for n in ("qemu-system-x86_64", "websockify", "cloudflared")
+    ]
+
 
 def snapshot() -> dict:
     return {"timestamp":time.time(),"cpu":{"percent":cpu_percent(),"count":cpu_count()},

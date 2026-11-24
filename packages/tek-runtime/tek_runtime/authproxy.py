@@ -47,6 +47,7 @@ from .crypto import (
     verify_cookie_value,
     verify_descriptor_token,
     verify_kickoff_token,
+    verify_kickoff_v2,
 )
 
 _NOVNC_ROOT   = Path("/usr/share/novnc")
@@ -181,7 +182,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._json(400,"BAD_REQUEST","WebSocket upgrade required.")
         elif path == "/tek/kickoff":
             qs = parse_qs(parsed.query)
-            self._handle_kickoff(qs.get("t", [""])[0])
+            self._handle_kickoff(qs.get("t", [""])[0], qs)
         elif path in ("/websockify", "/websockify/"):
             if self.headers.get("Upgrade", "").lower() == "websocket":
                 self._handle_ws_upgrade()
@@ -379,13 +380,31 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         _, sid, _, _ = self.proxy.state.snapshot()
         self._issue_cookie(sid)
 
-    def _handle_kickoff(self, token: str) -> None:
+    def _handle_kickoff(self, token: str, qs: dict | None = None) -> None:
         if not self._session_ready():
             return
         ip = self._client_ip()
         if not self._rate_check(f"kickoff:{ip}"):
             return
         p = self.proxy
+        qs = qs or {}
+        if "k" in qs:
+            # v2: every URL carries its own timestamp + nonce + token and works ONCE,
+            # so the controller can mint a fresh URL for each open / reconnect.
+            try:
+                ts, nonce, k = int(qs["ts"][0]), qs["n"][0], qs["k"][0]
+            except (KeyError, IndexError, ValueError):
+                self._json(401, "AUTH_FAILED", "Malformed kickoff URL.")
+                return
+            if not verify_kickoff_v2(p.secret, ts, nonce, k):
+                self._json(401, "AUTH_FAILED", "Invalid or expired kickoff URL.")
+                return
+            if not p.claim_kickoff(ts, nonce):
+                self._json(410, "AUTH_FAILED", "Kickoff URL already used.")
+                return
+            _, sid, _, _ = p.state.snapshot()
+            self._issue_cookie(sid, redirect="/vnc.html")
+            return
         if p.kickoff_used:
             self._json(410, "AUTH_FAILED", "Kickoff token already used.")
             return
@@ -589,6 +608,8 @@ class AuthProxy:
         self.secret       = secret
         self.state        = _SessionState()
         self.kickoff_used = False
+        self._used_kickoffs: dict[tuple[int, str], float] = {}
+        self._kickoff_lock = threading.Lock()
         self.rate_limiter = _RateLimiter(max_attempts=10, window_s=300)
 
         # Active WebSocket pipe sockets
@@ -599,6 +620,21 @@ class AuthProxy:
         self._thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------ #
+
+    def claim_kickoff(self, ts: int, nonce: str, ttl_s: int = 900) -> bool:
+        """Atomically mark a (ts, nonce) kickoff URL as used; False if it was used before.
+
+        Called only AFTER the HMAC verified, so unauthenticated clients cannot grow the table.
+        """
+        now = time.time()
+        with self._kickoff_lock:
+            for key, seen in list(self._used_kickoffs.items()):
+                if now - seen > ttl_s:
+                    del self._used_kickoffs[key]
+            if (ts, nonce) in self._used_kickoffs:
+                return False
+            self._used_kickoffs[(ts, nonce)] = now
+            return True
 
     def mark_ready(
         self, session_id: str, descriptor_json: str, tunnel_host: str
@@ -634,9 +670,16 @@ class AuthProxy:
         #    call t.join(timeout=2.0), and exit cleanly before server.shutdown().
         time.sleep(_PIPE_DRAIN_S)
 
-        # 3. Stop accepting new connections.
+        # 3. Stop serving AND release the listening socket. shutdown() alone leaves
+        #    the port bound, so a later start() in the same process fails with
+        #    "Address already in use".
         if self._server:
             self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        if self._thread:
+            self._thread.join(timeout=3)
+            self._thread = None
 
     # ------------------------------------------------------------------ #
 

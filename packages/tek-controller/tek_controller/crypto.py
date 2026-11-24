@@ -92,3 +92,9 @@ def make_cookie_value(secret: bytes, session_id: str, expiry_unix: int) -> str:
     msg = f"{expiry_unix}:{session_id}".encode()
     sig = _hmac.new(secret, msg, hashlib.sha256).hexdigest()[:_COOKIE_SIG_LEN]
     return f"{expiry_unix}.{session_id}.{sig}"
+
+
+def kickoff_token_v2(secret: bytes, ts: int, nonce: str) -> str:
+    """Per-URL kickoff token bound to a timestamp and a random nonce (mirrors the runtime)."""
+    info = f"tek/v0/kickoff/{int(ts)}/{nonce}".encode()
+    return _b64url(_hkdf_sha256(secret, _SALT, info, 32))

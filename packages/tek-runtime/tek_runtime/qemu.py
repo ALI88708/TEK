@@ -1,89 +1,181 @@
-"""QEMU lifecycle: start, monitor, graceful stop with escalation.
+"""QEMU lifecycle — generic, OS-agnostic VM manager.
 
-Design decisions:
-1.  No -daemonize — Popen() keeps the PID in our control.
-2.  Stop escalation: system_powerdown → SIGTERM → SIGKILL, each verified.
-3.  QEMU output is redirected to a log file (_QEMU_LOG), never to stdout.
-    The log file handle is stored at module level and closed in _cleanup().
-4.  VNC password is set through the monitor after startup. The monitor
-    response is checked; the password is never included in any exception
-    message or log line.
-5.  The module keeps a single global _proc / _log_fd pair.
-    Calling start() while already running is an error.
+Design:
+  - Accepts explicit vcpu/ram/firmware/machine/boot_order/extra_args.
+  - No hard-coded OS assumptions.
+  - Supports BIOS (default) and UEFI (requires OVMF).
+  - VNC discovery: uses `:0,to=10` so QEMU auto-selects a free port in 5900-5910.
+  - Stop escalation: system_powerdown → SIGTERM → SIGKILL.
+  - Log file: stdout/stderr → _QEMU_LOG (never to notebook output).
+  - VNC password: set via monitor, never logged.
 """
 from __future__ import annotations
 
-import io
+import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 from typing import IO
 
-_MON_SOCK = "/tmp/tek-qemu-mon.sock"
-_QEMU_LOG = "/tmp/tek-qemu.log"
+from .procs import pids_by_name
+
+# QMP (JSON) control socket. start() puts it inside a private 0700 directory so
+# other local users cannot connect to it.
+_MON_SOCK = "/tmp/tek-qemu-qmp.sock"
+_MON_DIR: str | None = None
+_QEMU_LOG  = os.path.join(tempfile.gettempdir(), "tek-qemu.log")
+_VNC_BASE  = 5900          # VNC display :0 = port 5900
 
 _proc:   subprocess.Popen | None = None
-_log_fd: IO[str]          | None = None   # held open while QEMU runs
+_log_fd: IO[str]           | None = None
+
+
+# ======================================================================
+# UEFI firmware discovery
+# ======================================================================
+
+_OVMF_PATHS = [
+    "/usr/share/OVMF/OVMF_CODE.fd",
+    "/usr/share/ovmf/OVMF.fd",
+    "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+    "/usr/share/OVMF/x64/OVMF_CODE.fd",
+]
+
+
+def _find_ovmf() -> str | None:
+    for p in _OVMF_PATHS:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def ensure_uefi_firmware() -> str:
+    """Return path to OVMF firmware, installing it if needed.
+
+    Raises RuntimeError if OVMF cannot be installed.
+    """
+    path = _find_ovmf()
+    if path:
+        return path
+    # Try to install
+    result = subprocess.run(
+        ["apt-get", "-qq", "install", "-y", "ovmf"],
+        capture_output=True, env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "UEFI firmware (OVMF) could not be installed. "
+            "Install it manually: apt-get install ovmf"
+        )
+    path = _find_ovmf()
+    if not path:
+        raise RuntimeError(
+            "OVMF installed but firmware file not found. "
+            f"Searched: {_OVMF_PATHS}"
+        )
+    return path
 
 
 # ======================================================================
 # Monitor helpers
 # ======================================================================
 
-def _mon(cmd: str, timeout: float = 5.0) -> str:
-    """Send one HMP command and return the raw response string."""
+class QmpError(RuntimeError):
+    """A QMP command failed, timed out, or the socket is unusable."""
+
+
+def _qmp(execute: str, arguments: dict | None = None, timeout: float = 5.0):
+    """Run one QMP command on a fresh connection and return its `return` value."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
         s.connect(_MON_SOCK)
-        s.sendall((cmd + "\n").encode())
-        time.sleep(0.25)
-        try:
-            data = s.recv(65536).decode(errors="replace")
-        except socket.timeout:
-            data = ""
-        return data.strip()
+        f = s.makefile("rw", encoding="utf-8", newline="\n")
+
+        def send(cmd: dict) -> None:
+            f.write(json.dumps(cmd) + "\n")
+            f.flush()
+
+        def reply():
+            while True:
+                line = f.readline()
+                if not line:
+                    raise QmpError(f"QMP connection closed during {execute!r}")
+                msg = json.loads(line)
+                if "return" in msg:
+                    return msg["return"]
+                if "error" in msg:
+                    raise QmpError(str(msg["error"].get("desc", "QMP error")))
+                # otherwise: an asynchronous event, ignore it
+
+        if "QMP" not in json.loads(f.readline() or "{}"):
+            raise QmpError("unexpected QMP greeting")
+        send({"execute": "qmp_capabilities"})
+        reply()
+        cmd: dict = {"execute": execute}
+        if arguments:
+            cmd["arguments"] = arguments
+        send(cmd)
+        return reply()
+    except socket.timeout as exc:
+        raise QmpError(f"QMP timeout during {execute!r}") from exc
+    except (OSError, ValueError) as exc:
+        raise QmpError(f"QMP communication error during {execute!r}: {exc}") from exc
     finally:
         s.close()
 
 
 def _set_vnc_password(password: str) -> None:
-    """Set the VNC session password via the HMP monitor.
-
-    Raises RuntimeError on timeout or monitor error.
-    The password is NEVER included in any exception message or log output.
-    """
+    """Set the VNC password. The password never appears in any error message."""
     try:
-        response = _mon(f"change vnc password {password}")
-    except Exception as exc:
+        _qmp("set_password", {"protocol": "vnc", "password": password})
+    except QmpError as exc:
         raise RuntimeError(
-            "QEMU monitor did not accept the VNC password command "
-            "(communication error)."
-        ) from exc
+            "QEMU did not accept the VNC password: " + str(exc).replace(password, "<redacted>")
+        ) from None
 
-    if not response:
-        # socket.timeout inside _mon returns "" — we cannot confirm success
-        raise RuntimeError(
-            "QEMU monitor did not respond to the VNC password command (timeout). "
-            "The password may not have been set."
-        )
 
-    # HMP reports errors on a line starting with or containing "Error"
-    lower = response.lower()
-    if "error" in lower or "invalid" in lower:
-        # Strip the password from the response before surfacing it
-        safe = response.replace(password, "<redacted>")
-        raise RuntimeError(
-            f"QEMU monitor returned an error while setting VNC password: {safe}"
-        )
+def get_vnc_port() -> int | None:
+    """The VNC port QEMU actually bound (query-vnc). None if it cannot be determined."""
+    try:
+        info = _qmp("query-vnc")
+    except QmpError:
+        return None
+    service = str(info.get("service", ""))
+    return int(service) if info.get("enabled") and service.isdigit() else None
+
+
+def wait_vnc_ready(port: int, timeout: float = 15.0) -> None:
+    """Block until a real VNC server answers on `port` (RFB banner), else raise."""
+    deadline = time.time() + timeout
+    last = "no connection"
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0) as s:
+                s.settimeout(1.0)
+                banner = s.recv(12)
+                if banner.startswith(b"RFB "):
+                    return
+                last = f"unexpected banner {banner[:12]!r}"
+        except OSError as exc:
+            last = str(exc)
+        time.sleep(0.3)
+    raise RuntimeError(f"No VNC server answered on 127.0.0.1:{port} ({last}).")
+
+
+def foreign_qemu_pids() -> list[int]:
+    """PIDs of qemu-system-x86_64 processes that this module did not start."""
+    mine = _proc.pid if _proc is not None else None
+    return [p for p in pids_by_name("qemu-system-x86_64") if p != mine]
 
 
 def _read_log_tail(n: int = 20) -> str:
     try:
-        lines = open(_QEMU_LOG).readlines()
-        return "".join(lines[-n:])
+        return "".join(open(_QEMU_LOG).readlines()[-n:])
     except OSError:
         return ""
 
@@ -93,35 +185,49 @@ def _read_log_tail(n: int = 20) -> str:
 # ======================================================================
 
 def start(
-    iso_path: str,
-    vcpu: int,
-    ram_mb: int,
+    iso_path:   str,
+    vcpu:       int,
+    ram_mb:     int,
     vnc_password: str,
-    disk_path: str | None = None,
-    machine: str = "pc",
-    boot_order: str = "d",
-    extra_args: list | None = None,
+    *,
+    disk_path:    str | None = None,
+    machine:      str        = "pc",
+    boot_order:   str        = "d",
+    firmware:     str        = "bios",
+    extra_args:   list[str] | None = None,
 ) -> None:
-    """Start QEMU as a tracked child process. Raises if already running.
+    """Start QEMU as a tracked child process.
 
     Parameters
     ----------
-    iso_path    Path to the CD-ROM ISO.
-    vcpu        Number of virtual CPUs.
-    ram_mb      Guest RAM in megabytes.
-    vnc_password  VNC password (derived from session secret; never logged).
-    disk_path   Optional path to a QCOW2 persistent disk image.
-    machine     QEMU -machine type. "pc" (default) or "q35" (Windows).
-    boot_order  QEMU boot order. "d" = CD-ROM first.
-    extra_args  Additional raw QEMU arguments (from GuestConfig.extra_qemu_args).
+    iso_path      Path to the CD-ROM ISO.
+    vcpu          Virtual CPU count.
+    ram_mb        Guest RAM in MB.
+    vnc_password  Derived from session secret — never logged.
+    disk_path     Optional QCOW2 persistent disk.
+    machine       "pc" (i440FX) or "q35" (ICH9/Windows).
+    boot_order    QEMU -boot argument ("d", "c", "dc", ...).
+    firmware      "bios" or "uefi".
+    extra_args    Additional raw QEMU arguments.
     """
     global _proc, _log_fd
 
     if _proc is not None and _proc.poll() is None:
         raise RuntimeError("QEMU is already running. Call stop() first.")
 
-    if os.path.exists(_MON_SOCK):
-        os.remove(_MON_SOCK)
+    foreign = foreign_qemu_pids()
+    if foreign:
+        raise RuntimeError(
+            f"Another qemu-system-x86_64 process is already running (PID {foreign[0]}) "
+            "and was not started by this session (orphan from an earlier run?). "
+            "TEK will not kill processes it does not own. "
+            "Stop it yourself (e.g. !pkill -x qemu-system-x86_64) and retry."
+        )
+
+    global _MON_SOCK, _MON_DIR
+    _cleanup_socket()
+    _MON_DIR = tempfile.mkdtemp(prefix="tek-qmp-")          # mode 0700
+    _MON_SOCK = os.path.join(_MON_DIR, "qmp.sock")
 
     cmd = [
         "qemu-system-x86_64",
@@ -130,20 +236,28 @@ def start(
         "-machine", machine,
         "-smp",     str(vcpu),
         "-m",       str(ram_mb),
-        "-cdrom",   iso_path,
-        "-boot",    boot_order,
         "-vga",     "std",
-        # :0,to=10 lets QEMU find a free port in 5900–5910 if 5900 is taken
         "-vnc",     "127.0.0.1:0,to=10,password=on",
-        "-monitor", f"unix:{_MON_SOCK},server,nowait",
-        # No -daemonize: keep the Popen handle for safe shutdown.
+        "-qmp",     f"unix:{_MON_SOCK},server=on,wait=off",
     ]
+
+    # Firmware
+    if firmware == "uefi":
+        ovmf = ensure_uefi_firmware()
+        cmd += ["-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={ovmf}"]
+
+    # CD-ROM + boot
+    if iso_path:
+        cmd += ["-cdrom", iso_path, "-boot", boot_order]
+
+    # Persistent disk
     if disk_path:
         cmd += ["-drive", f"file={disk_path},format=qcow2,if=virtio"]
+
+    # Extra OS-specific args
     if extra_args:
         cmd += extra_args
 
-    # Open log file before Popen so we can close it if Popen raises.
     _log_fd = open(_QEMU_LOG, "w")
     try:
         _proc = subprocess.Popen(
@@ -157,7 +271,7 @@ def start(
         _log_fd = None
         raise
 
-    # Wait for monitor socket (up to 20 s)
+    # Wait for monitor socket
     for _ in range(40):
         if os.path.exists(_MON_SOCK):
             break
@@ -165,15 +279,13 @@ def start(
             tail = _read_log_tail()
             _cleanup_all()
             raise RuntimeError(
-                f"QEMU exited prematurely (code {_proc.returncode}).\n{tail}"
+                f"QEMU exited (code {_proc.returncode}).\n{tail}"
             )
         time.sleep(0.5)
     else:
         _force_kill("monitor socket never appeared")
         raise RuntimeError("QEMU monitor socket did not appear within 20 s.")
 
-    # Set VNC password and verify the monitor accepted it.
-    # Raises RuntimeError if the monitor returns an error or times out.
     _set_vnc_password(vnc_password)
 
 
@@ -182,14 +294,14 @@ def start(
 # ======================================================================
 
 def pid() -> int | None:
-    return _proc.pid if _proc is not None else None
+    return _proc.pid if _proc else None
 
 
 def status() -> str | None:
+    """QEMU run state ("running", "paused", ...) or None if QMP is unreachable."""
     try:
-        out = _mon("info status")
-        return out.splitlines()[0] if out else None
-    except Exception:
+        return str(_qmp("query-status").get("status"))
+    except QmpError:
         return None
 
 
@@ -201,9 +313,9 @@ def is_alive() -> bool:
 
 def screenshot(path: str) -> bool:
     try:
-        _mon(f"screendump {path}")
+        _qmp("screendump", {"filename": path})
         return os.path.exists(path)
-    except Exception:
+    except QmpError:
         return False
 
 
@@ -217,40 +329,25 @@ _SIGKILL_WAIT_S   = 5
 
 
 def stop() -> None:
-    """Gracefully stop QEMU with safe escalation.
-
-    Steps:
-      1. system_powerdown (ACPI) — waits _POWERDOWN_WAIT_S s.
-      2. SIGTERM               — waits _SIGTERM_WAIT_S s.
-      3. SIGKILL               — waits _SIGKILL_WAIT_S s.
-      4. Warning if still alive (process state is unresolved).
-    Each step is skipped if the process has already exited.
-    """
     global _proc
-
     if _proc is None:
         _cleanup_all()
         return
-
     try:
-        _mon("system_powerdown")
-    except Exception:
+        _qmp("system_powerdown")
+    except QmpError:
         pass
-
     if _wait_for_exit(_POWERDOWN_WAIT_S):
         _cleanup_all()
         return
-
     _safe_signal(_proc, signal.SIGTERM)
     if _wait_for_exit(_SIGTERM_WAIT_S):
         _cleanup_all()
         return
-
     _safe_signal(_proc, signal.SIGKILL)
     if _wait_for_exit(_SIGKILL_WAIT_S):
         _cleanup_all()
         return
-
     print(
         f"WARNING: QEMU (PID {_proc.pid}) did not exit after SIGKILL. "
         "Manual intervention required."
@@ -263,7 +360,6 @@ def stop() -> None:
 # ======================================================================
 
 def _force_kill(reason: str) -> None:
-    """SIGKILL without escalation — used when startup fails."""
     global _proc
     if _proc is None:
         return
@@ -272,7 +368,7 @@ def _force_kill(reason: str) -> None:
         _proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
-    print(f"WARNING: QEMU force-killed during startup: {reason}")
+    print(f"WARNING: QEMU force-killed: {reason}")
     _cleanup_all()
 
 
@@ -295,9 +391,7 @@ def _safe_signal(proc: subprocess.Popen, sig: signal.Signals) -> None:
 
 
 def _cleanup_all() -> None:
-    """Close the log file, clear the process handle, remove the socket."""
     global _proc, _log_fd
-    # Close log file only after the process has exited (or been killed).
     if _log_fd is not None:
         try:
             _log_fd.close()
@@ -309,8 +403,12 @@ def _cleanup_all() -> None:
 
 
 def _cleanup_socket() -> None:
-    if os.path.exists(_MON_SOCK):
-        try:
+    global _MON_DIR
+    try:
+        if os.path.exists(_MON_SOCK):
             os.remove(_MON_SOCK)
-        except OSError:
-            pass
+    except OSError:
+        pass
+    if _MON_DIR:
+        shutil.rmtree(_MON_DIR, ignore_errors=True)
+        _MON_DIR = None

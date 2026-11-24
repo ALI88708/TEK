@@ -316,9 +316,6 @@ class TestLiveProxy:
 # NOT_RUN markers
 # ======================================================================
 
-@pytest.mark.skip(reason="NOT_RUN: requires noVNC + websockify on 6081")
-def test_websocket_upgrade_and_pipe_e2e():
-    pass
 
 @pytest.mark.skip(reason="NOT_RUN: requires real Cloudflare tunnel for Origin header")
 def test_origin_check_with_tunnel_host():

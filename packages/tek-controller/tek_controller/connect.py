@@ -61,12 +61,21 @@ def _make_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def _base_url(host: str, scheme: str) -> str:
+    if scheme == "https":
+        return f"https://{host}"
+    if scheme == "http" and host.split(":")[0] in ("127.0.0.1", "localhost"):
+        return f"http://{host}"          # plaintext is allowed ONLY for loopback (tests)
+    raise ValueError("plain http is only allowed for 127.0.0.1/localhost")
+
+
 def fetch_descriptor(
     secret: bytes,
     host: str,
     *,
     verify_expiry: bool = True,
     timeout_s: int = _DEFAULT_TIMEOUT_S,
+    scheme: str = "https",
 ) -> dict:
     """Fetch the session descriptor from the runtime and validate it.
 
@@ -77,7 +86,7 @@ def fetch_descriptor(
       4. Parse + validate          → DESCRIPTOR_ERROR / AUTH_FAILED
     """
     token = descriptor_token(secret)
-    url   = f"https://{host}/tek/descriptor"
+    url   = f"{_base_url(host, scheme)}/tek/descriptor"
 
     req = urllib.request.Request(
         url,
@@ -161,7 +170,7 @@ def fetch_descriptor(
 
     # Verify that the runtime is using the same secret
     expected_fp = fingerprint(secret)
-    actual_fp   = desc.get("secret_fingerprint", "")
+    actual_fp   = desc.secret_fingerprint          # parse_descriptor returns a SessionDescriptor
     if actual_fp != expected_fp:
         raise ConnectError(
             "AUTH_FAILED",
@@ -170,13 +179,20 @@ def fetch_descriptor(
             f"Expected {expected_fp}, got {actual_fp}.",
         )
 
-    return desc
+    return json.loads(raw)      # the validated descriptor as a dict (what the UI layer consumes)
 
 
 def build_kickoff_url(secret: bytes, host: str) -> str:
-    """URL that sets the session cookie and redirects to /vnc.html."""
-    from .crypto import kickoff_token as _kt
-    return f"https://{host}/tek/kickoff?t={_kt(secret)}"
+    """A FRESH single-use URL that sets the session cookie in a browser and opens noVNC.
+
+    Every call mints a new (timestamp, nonce, token); call it again to reconnect.
+    The token is valid for ~5 minutes and works once (it does appear in browser history).
+    """
+    import secrets as _s
+    import time as _t
+    from .crypto import kickoff_token_v2 as _k2
+    ts, nonce = int(_t.time()), _s.token_urlsafe(12)
+    return f"https://{host}/tek/kickoff?ts={ts}&n={nonce}&k={_k2(secret, ts, nonce)}"
 
 
 def fetch_with_retry(
@@ -223,12 +239,13 @@ def fetch_with_retry(
     raise last_exc  # type: ignore[misc]
 
 
-def fetch_metrics(secret: bytes, host: str, session_cookie: str, *, timeout_s: int = 8) -> dict:
+def fetch_metrics(secret: bytes, host: str, session_cookie: str, *, timeout_s: int = 8,
+                  scheme: str = "https") -> dict:
     """Fetch live host metrics from /tek/metrics."""
     ssl_ctx = _make_ssl_context()
     opener  = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl_ctx))
     req = urllib.request.Request(
-        f"https://{host}/tek/metrics",
+        f"{_base_url(host, scheme)}/tek/metrics",
         headers={"Cookie": f"tek_session={session_cookie}", "Connection": "close"},
     )
     try:
@@ -238,6 +255,8 @@ def fetch_metrics(secret: bytes, host: str, session_cookie: str, *, timeout_s: i
     except socket.timeout:
         raise ConnectError("TIMEOUT","Metrics request timed out.")
     except urllib.error.HTTPError as exc:
-        raise ConnectError("HTTP_ERROR",f"HTTP {exc.code}")
+        if exc.code == 401:
+            raise ConnectError("AUTH_FAILED", "Session cookie rejected (expired or wrong session).")
+        raise ConnectError("HTTP_ERROR", f"HTTP {exc.code}")
     except urllib.error.URLError as exc:
-        raise ConnectError("TUNNEL_FAILED",str(exc.reason))
+        raise ConnectError("TUNNEL_FAILED", str(exc.reason))

@@ -116,6 +116,10 @@ def test_stop_safe_when_no_process():
     Q.stop()   # must not raise
 
 
+@pytest.mark.skipif(
+    not hasattr(__import__("socket"), "AF_UNIX"),
+    reason="stop() negotiates QMP over an AF_UNIX socket (Linux/Kaggle only)",
+)
 def test_stop_kills_process_responding_to_sigterm():
     Q._proc = _spawn_sleeper(60)
     pid = Q._proc.pid
@@ -131,6 +135,10 @@ def test_stop_kills_process_responding_to_sigterm():
     assert not still_alive, f"PID {pid} still alive after stop()"
 
 
+@pytest.mark.skipif(
+    not hasattr(__import__("socket"), "AF_UNIX"),
+    reason="stop() negotiates QMP over an AF_UNIX socket (Linux/Kaggle only)",
+)
 def test_stop_clears_proc_and_log_fd():
     import tempfile
     Q._log_fd = open(tempfile.mktemp(), "w")
@@ -144,41 +152,31 @@ def test_stop_clears_proc_and_log_fd():
 
 
 # ------------------------------------------------------------------ #
-# _set_vnc_password  (unit — no QEMU)                                 #
+# _set_vnc_password  (unit; _qmp is replaced, no QEMU)                #
 # ------------------------------------------------------------------ #
 
-def test_set_vnc_password_raises_on_empty_response(monkeypatch):
-    """Empty monitor response (timeout) must raise, not silently succeed."""
-    monkeypatch.setattr(Q, "_mon", lambda cmd, timeout=5.0: "")
-    with pytest.raises(RuntimeError, match="did not respond"):
-        Q._set_vnc_password("secret123")
-
-
-def test_set_vnc_password_raises_on_error_response(monkeypatch):
-    monkeypatch.setattr(Q, "_mon", lambda cmd, timeout=5.0: "Error: bad password")
-    with pytest.raises(RuntimeError):
+def test_set_vnc_password_timeout_raises(monkeypatch):
+    def boom(*a, **k): raise Q.QmpError("QMP timeout during 'set_password'")
+    monkeypatch.setattr(Q, "_qmp", boom)
+    with pytest.raises(RuntimeError, match="VNC password"):
         Q._set_vnc_password("secret123")
 
 
 def test_set_vnc_password_error_does_not_contain_password(monkeypatch):
-    monkeypatch.setattr(Q, "_mon",
-        lambda cmd, timeout=5.0: "Error: invalid parameter 'hunter2'")
+    def boom(*a, **k): raise Q.QmpError("Invalid parameter 'hunter2'")
+    monkeypatch.setattr(Q, "_qmp", boom)
     with pytest.raises(RuntimeError) as exc_info:
         Q._set_vnc_password("hunter2")
-    assert "hunter2" not in str(exc_info.value), \
-        "Password must not appear in the error message"
+    assert "hunter2" not in str(exc_info.value)
+    assert exc_info.value.__suppress_context__ is True   # raised `from None`
 
 
-def test_set_vnc_password_ok_on_prompt_response(monkeypatch):
-    """A response that contains only the monitor prompt is a success."""
-    monkeypatch.setattr(Q, "_mon", lambda cmd, timeout=5.0: "(qemu)")
-    Q._set_vnc_password("any_password")  # must not raise
-
-
-def test_set_vnc_password_ok_on_empty_ok_response(monkeypatch):
-    """Some QEMU versions return just a blank prompt — no 'error' keyword."""
-    monkeypatch.setattr(Q, "_mon", lambda cmd, timeout=5.0: "\r\n(qemu) \r\n")
-    Q._set_vnc_password("any_password")
+def test_set_vnc_password_ok(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(Q, "_qmp", lambda cmd, args=None, timeout=5.0: seen.update(cmd=cmd, args=args) or {})
+    Q._set_vnc_password("pw123456")
+    assert seen["cmd"] == "set_password"
+    assert seen["args"] == {"protocol": "vnc", "password": "pw123456"}
 
 
 # ------------------------------------------------------------------ #
@@ -189,9 +187,6 @@ def test_set_vnc_password_ok_on_empty_ok_response(monkeypatch):
 def test_full_qemu_start_on_kaggle():
     pass
 
-@pytest.mark.skip(reason="NOT_RUN: SIGKILL path requires process ignoring SIGTERM")
-def test_sigkill_escalation_on_stubborn_process():
-    pass
 
 
 # ------------------------------------------------------------------ #
