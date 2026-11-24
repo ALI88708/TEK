@@ -1,140 +1,193 @@
-"""Guest OS configuration — separates VM settings from Runtime lifecycle.
+"""Guest OS configuration — generic, OS-agnostic.
 
-Design:
-  GuestConfig holds everything that depends on the guest OS choice.
-  The runtime session uses it to configure QEMU without hard-coding Alpine.
+GuestConfig holds everything that depends on the guest's setup:
+  - ISO source (local path, URL, or the Alpine shorthand for testing)
+  - Hardware: CPU cores, RAM, disk size
+  - Firmware: BIOS or UEFI
+  - QEMU machine type
+  - Display and boot options
 
-Supported OS types (tested status):
-  "linux"   — Any Linux LiveCD ISO. Alpine tested on Kaggle TCG.
-  "windows" — Windows ISO. NOT YET TESTED. Requires UEFI or BIOS.
-  "bsd"     — FreeBSD etc. NOT YET TESTED.
+Design rule: GuestConfig has NO built-in OS presets.
+  There are factory helpers for common setups, but they carry no special
+  QEMU magic — they are convenience wrappers around the same fields.
+  The old os_type="windows"/"bsd" preset system is removed; callers
+  set machine/boot_order/extra_qemu_args directly.
 
-Do NOT claim an OS type works until it has been tested on Kaggle.
+Alpine is kept only as a named factory (`for_alpine`) and as the default
+when no ISO is specified — it is NOT a required dependency of TEK.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 
-# ── OS presets ──────────────────────────────────────────────────────────────
-# These define QEMU-level settings per OS family.
-# A preset is a STARTING POINT; the caller can override any field.
-# "tested" = True means this has been verified to run on Kaggle TCG.
-
-_PRESETS: dict[str, dict] = {
-    "linux": {
-        "boot_order":    "d",           # CD-ROM first
-        "machine":       "pc",          # i440FX (most compatible)
-        "extra_args":    [],
-        "tested":        True,
-        "notes":         "Any Linux LiveCD. Alpine Linux verified on Kaggle TCG.",
-    },
-    "windows": {
-        "boot_order":    "d",
-        "machine":       "q35",         # Windows prefers Q35 chipset
-        "extra_args":    [
-            "-device", "usb-tablet",   # Windows needs absolute mouse input
-        ],
-        "tested":        False,
-        "notes":         "NOT TESTED on Kaggle. May need UEFI (OVMF). "
-                         "Windows 10/11 requires USB tablet for correct mouse.",
-    },
-    "bsd": {
-        "boot_order":    "d",
-        "machine":       "pc",
-        "extra_args":    [],
-        "tested":        False,
-        "notes":         "NOT TESTED on Kaggle.",
-    },
-}
+from .iso_manager import IsoSpec
 
 
 @dataclass
 class GuestConfig:
-    """Configuration for a guest OS session.
+    """Full configuration for a guest VM session.
 
     Parameters
     ----------
-    iso_path
-        Path to the ISO file on the Kaggle host.
-        For Alpine: auto-downloaded by fetch_iso.get_alpine().
-        For custom: provide a full path; validation is the caller's responsibility.
-    os_type
-        "linux" (default), "windows", or "bsd".
-        Only "linux" is tested; others are provided as a starting point.
+    iso
+        IsoSpec describing the boot ISO.  Use IsoSpec.alpine() for the
+        default Alpine test image, or IsoSpec.from_url(...) / .from_path(...).
     display_name
-        Human-readable name shown in logs and the descriptor.
-        Defaults to the ISO filename.
-    boot_order
-        QEMU boot order string. "d" = CD-ROM first (default).
+        Human label shown in Controller and logs.
+    vcpu
+        Virtual CPU count.  None = auto-assign from ResourcePlan.
+    ram_mb
+        Guest RAM in MB.  None = auto-assign from ResourcePlan.
+    disk_size_gb
+        Size of QCOW2 virtual disk to create.  0 = no persistent disk
+        (live ISO only).  Kaggle sessions are temporary — disk is lost
+        when the session ends unless explicitly exported.
+    firmware
+        "bios" (default, most compatible) or "uefi" (requires OVMF).
     machine
-        QEMU -machine argument. "pc" or "q35".
-        Windows needs "q35".
-    disk_path
-        Optional path to a QCOW2 persistent disk image.
-        None = no persistent disk (pure LiveCD / stateless session).
+        QEMU -machine argument.  "pc" (i440FX) or "q35" (ICH9).
+    boot_order
+        QEMU boot order string.  "d" = CD-ROM first, "c" = HDD first,
+        "dc" = CD-ROM then HDD.
     extra_qemu_args
-        Additional raw QEMU arguments appended after all others.
-        Use for OS-specific tweaks not covered by the preset.
+        Raw QEMU arguments appended after all auto-generated ones.
+    disk_path
+        Pre-existing QCOW2 path.  If set, disk_size_gb is ignored and
+        this disk is attached as-is.
     """
-    iso_path:        str
-    os_type:         str              = "linux"
-    display_name:    str              = ""
-    boot_order:      str              = "d"
-    machine:         str              = "pc"
-    disk_path:       str | None       = None
-    extra_qemu_args: list[str]        = field(default_factory=list)
+    iso:            IsoSpec
+    display_name:   str              = ""
+    vcpu:           int | None       = None   # None = ResourcePlan decides
+    ram_mb:         int | None       = None   # None = ResourcePlan decides
+    disk_size_gb:   float            = 0.0    # 0 = no disk, > 0 = create
+    firmware:       str              = "bios" # "bios" | "uefi"
+    machine:        str              = "pc"   # "pc" | "q35"
+    boot_order:     str              = "d"    # QEMU boot order
+    extra_qemu_args: list[str]       = field(default_factory=list)
+    disk_path:      str | None       = None   # pre-existing disk path
 
     def __post_init__(self) -> None:
         if not self.display_name:
-            self.display_name = os.path.basename(self.iso_path)
-        if self.os_type not in _PRESETS:
+            self.display_name = self.iso.display_name
+        if self.firmware not in ("bios", "uefi"):
             raise ValueError(
-                f"Unknown os_type {self.os_type!r}. "
-                f"Valid: {list(_PRESETS)}"
+                f"firmware must be 'bios' or 'uefi'; got {self.firmware!r}"
             )
-        preset = _PRESETS[self.os_type]
-        if not preset["tested"]:
-            import warnings
-            warnings.warn(
-                f"GuestConfig os_type={self.os_type!r} has NOT been tested on Kaggle. "
-                f"Notes: {preset['notes']}",
-                stacklevel=2,
+        if self.machine not in ("pc", "q35"):
+            raise ValueError(
+                f"machine must be 'pc' or 'q35'; got {self.machine!r}"
             )
-        # Apply preset defaults only if the caller left them at the dataclass default
-        if self.boot_order == "d" and preset["boot_order"] != "d":
-            self.boot_order = preset["boot_order"]
-        if self.machine == "pc" and preset["machine"] != "pc":
-            self.machine = preset["machine"]
-        if not self.extra_qemu_args and preset["extra_args"]:
-            self.extra_qemu_args = list(preset["extra_args"])
+        if self.vcpu is not None and self.vcpu < 1:
+            raise ValueError(f"vcpu must be >= 1; got {self.vcpu}")
+        if self.ram_mb is not None and self.ram_mb < 256:
+            raise ValueError(f"ram_mb must be >= 256; got {self.ram_mb}")
+
+    # -- factories --------------------------------------------------------
+
+    @classmethod
+    def for_alpine(cls, iso_path: str | None = None) -> "GuestConfig":
+        """Alpine Linux test image — downloads automatically if iso_path is None."""
+        iso = IsoSpec.from_path(iso_path) if iso_path else IsoSpec.alpine()
+        return cls(iso=iso, display_name="Alpine Linux", boot_order="d")
+
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        *,
+        sha256: str = "",
+        name: str = "",
+        disk_size_gb: float = 0.0,
+        firmware: str = "bios",
+        machine: str = "pc",
+        vcpu: int | None = None,
+        ram_mb: int | None = None,
+        boot_order: str = "d",
+        extra_qemu_args: list[str] | None = None,
+    ) -> "GuestConfig":
+        """Create from a direct ISO download URL."""
+        iso = IsoSpec.from_url(url, sha256=sha256, name=name)
+        return cls(
+            iso=iso,
+            display_name=name or iso.display_name,
+            disk_size_gb=disk_size_gb,
+            firmware=firmware,
+            machine=machine,
+            vcpu=vcpu,
+            ram_mb=ram_mb,
+            boot_order=boot_order,
+            extra_qemu_args=list(extra_qemu_args or []),
+        )
+
+    @classmethod
+    def from_local(
+        cls,
+        path: str,
+        *,
+        sha256: str = "",
+        name: str = "",
+        disk_size_gb: float = 0.0,
+        firmware: str = "bios",
+        machine: str = "pc",
+        vcpu: int | None = None,
+        ram_mb: int | None = None,
+        boot_order: str = "d",
+        extra_qemu_args: list[str] | None = None,
+    ) -> "GuestConfig":
+        """Create from a local ISO file path."""
+        iso = IsoSpec.from_path(path, sha256=sha256, name=name)
+        return cls(
+            iso=iso,
+            display_name=name or iso.display_name,
+            disk_size_gb=disk_size_gb,
+            firmware=firmware,
+            machine=machine,
+            vcpu=vcpu,
+            ram_mb=ram_mb,
+            boot_order=boot_order,
+            extra_qemu_args=list(extra_qemu_args or []),
+        )
+
+    @classmethod
+    def for_windows(cls, iso_path: str, *, disk_size_gb: float = 40.0) -> "GuestConfig":
+        """Windows ISO — q35 machine, UEFI recommended, USB tablet for mouse.
+
+        NOT TESTED on Kaggle TCG. UEFI requires OVMF to be installed.
+        """
+        import warnings
+        warnings.warn(
+            "GuestConfig.for_windows: Windows on Kaggle TCG is NOT TESTED. "
+            "UEFI requires OVMF. Mouse requires usb-tablet device.",
+            stacklevel=2,
+        )
+        return cls(
+            iso=IsoSpec.from_path(iso_path, name="Windows"),
+            display_name="Windows",
+            machine="q35",
+            firmware="uefi",
+            disk_size_gb=disk_size_gb,
+            extra_qemu_args=["-device", "usb-tablet"],
+        )
+
+    # -- helpers ----------------------------------------------------------
+
+    @property
+    def needs_disk(self) -> bool:
+        return self.disk_size_gb > 0 and self.disk_path is None
+
+    @property
+    def has_disk(self) -> bool:
+        return bool(self.disk_path) or self.disk_size_gb > 0
 
     def preset_notes(self) -> str:
-        return _PRESETS[self.os_type]["notes"]
-
-    @classmethod
-    def for_alpine(cls, iso_path: str) -> "GuestConfig":
-        """Pre-configured for Alpine Linux LiveCD (tested)."""
-        return cls(
-            iso_path=iso_path,
-            os_type="linux",
-            display_name="Alpine Linux",
-        )
-
-    @classmethod
-    def for_custom_linux(cls, iso_path: str, display_name: str = "") -> "GuestConfig":
-        """Any Linux LiveCD."""
-        return cls(
-            iso_path=iso_path,
-            os_type="linux",
-            display_name=display_name or os.path.basename(iso_path),
-        )
-
-    @classmethod
-    def for_windows(cls, iso_path: str) -> "GuestConfig":
-        """Windows ISO — NOT TESTED on Kaggle. Use with caution."""
-        return cls(
-            iso_path=iso_path,
-            os_type="windows",
-            display_name="Windows",
-        )
+        """Human-readable notes about this config."""
+        notes = [f"ISO: {self.iso.display_name}"]
+        if self.firmware == "uefi":
+            notes.append("Firmware: UEFI (requires OVMF on host)")
+        if self.disk_size_gb > 0:
+            notes.append(
+                f"Disk: {self.disk_size_gb:.0f} GB QCOW2 "
+                "(NOTE: Kaggle sessions are temporary — disk lost on session end)"
+            )
+        return "  ".join(notes)

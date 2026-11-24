@@ -19,6 +19,7 @@ from tek_controller import theme
 from tek_controller.connect import (
     ConnectError, build_kickoff_url, fetch_descriptor, fetch_metrics,
 )
+from tek_controller.views.vm_config import VmConfigView
 from tek_controller.views.control_panel import ControlPanelView
 from tek_controller.views.vnc_window import VncWindow
 from tek_controller.views.terminal_window import TerminalWindow
@@ -55,6 +56,10 @@ VIEW_META: dict[str, tuple[str, str]] = {
     "connection": (
         "Connection",
         "Connect to a live runtime or validate a descriptor manually.",
+    ),
+    "vm_config": (
+        "Start VM",
+        "Configure and start a virtual machine with any ISO.",
     ),
     "control_panel": (
         "Control Panel",
@@ -224,6 +229,7 @@ class TekControllerApp:
                 ("02", "connection", "Connection"),
                 ("03", "settings", "Settings"),
                 ("04", "control_panel", "Control Panel"),
+                ("05", "vm_config", "Start VM"),
             ),
             self.show_view,
         )
@@ -296,11 +302,17 @@ class TekControllerApp:
         self.control_panel_view = ControlPanelView(
             self.container, on_refresh=self._fetch_live_metrics,
         )
+        self.vm_config_view = VmConfigView(
+            self.container,
+            on_generated=self._on_snippet_generated,
+            on_cancel=lambda: self.show_view("dashboard"),
+        )
         self.views: dict[str, tk.Frame] = {
             "dashboard": self.dashboard,
             "connection": self.connection_view,
             "settings": self.settings_view,
             "control_panel": self.control_panel_view,
+            "vm_config": self.vm_config_view,
         }
         for view in self.views.values():
             view.grid(row=0, column=0, sticky="nsew")
@@ -402,6 +414,13 @@ class TekControllerApp:
                 _exc = exc
                 self.root.after(0, lambda e=_exc: self._on_fetch_error(e))
                 return
+            except Exception as exc:  # noqa: BLE001 - never leave the UI stuck on "AUTHENTICATING"
+                _exc = ConnectError(
+                    "INTERNAL_ERROR",
+                    f"Unexpected {type(exc).__name__} while fetching the descriptor: {exc}",
+                )
+                self.root.after(0, lambda e=_exc: self._on_fetch_error(e))
+                return
             self.root.after(0, lambda: self._on_fetch_ok(secret, host, desc_dict))
 
         threading.Thread(target=_fetch, daemon=True).start()
@@ -485,6 +504,16 @@ class TekControllerApp:
         webbrowser.open(url)
         self.dashboard.log(f"Opened display in browser for host {host}.")
 
+    # -- VM config handler -----------------------------------------------
+
+    def _on_snippet_generated(self, config: dict, snippet: str) -> None:
+        """The snippet is shown in the VM config view; this only records it (no secret is touched)."""
+        self.dashboard.log(
+            f"Kaggle snippet generated: ISO={config['iso_type']}, firmware={config['firmware']}, "
+            f"machine={config['machine']}, disk={config['disk_size_gb']:g} GB. "
+            "Paste it into the notebook on Kaggle."
+        )
+
     # -- live metrics -------------------------------------------------------
 
     def _session_cookie_value(self) -> str:
@@ -521,8 +550,10 @@ class TekControllerApp:
         if not host or not secret:
             self.dashboard.log('No active session — connect first.')
             return
-        kurl = build_kickoff_url(secret, host)
-        VncWindow(self.root, tunnel_host=host, kickoff_url=kurl).focus_set()
+        VncWindow(
+            self.root, tunnel_host=host,
+            url_factory=lambda: build_kickoff_url(secret, host),
+        ).focus_set()
         self.dashboard.log(f'VNC window opened for {host}.')
 
     def open_terminal_window(self) -> None:

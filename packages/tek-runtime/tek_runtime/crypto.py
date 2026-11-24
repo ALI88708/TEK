@@ -143,3 +143,22 @@ def verify_kickoff_token(secret: bytes, token: str) -> bool:
 def relay_token(secret: bytes) -> str:
     """frp authentication token derived from session secret."""
     return b64url_encode(_hkdf_sha256(secret, _SALT, b"tek/v0/relay", 32))
+
+
+_NONCE_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+def kickoff_token_v2(secret: bytes, ts: int, nonce: str) -> str:
+    """Per-URL kickoff token bound to a timestamp and a random nonce."""
+    info = f"tek/v0/kickoff/{int(ts)}/{nonce}".encode()
+    return b64url_encode(_hkdf_sha256(secret, _SALT, info, 32))
+
+
+def verify_kickoff_v2(secret: bytes, ts: int, nonce: str, token: str,
+                      now: float | None = None, window_s: int = 300) -> bool:
+    """True if the token is valid and `ts` is within +-window_s of now."""
+    if not _NONCE_RE.match(nonce or ""):
+        return False
+    if abs((now if now is not None else time.time()) - ts) > window_s:
+        return False
+    return _hmac.compare_digest(token, kickoff_token_v2(secret, ts, nonce))

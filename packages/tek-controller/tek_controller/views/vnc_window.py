@@ -6,12 +6,13 @@ from tek_controller import theme
 P = theme.PALETTE
 
 class VncWindow(tk.Toplevel):
-    def __init__(self,master,*,tunnel_host:str,kickoff_url:str,
+    def __init__(self,master,*,tunnel_host:str,kickoff_url:str='',
+                 url_factory:Callable[[],str]|None=None,
                  on_disconnect:Callable[[],None]|None=None):
         super().__init__(master)
         self.title("TEK — Guest VM Display"); self.geometry("780x480")
         self.configure(bg=P["bg"]); self.protocol("WM_DELETE_WINDOW",self._on_close)
-        self._host=tunnel_host; self._kickoff=kickoff_url
+        self._host=tunnel_host; self._kickoff=kickoff_url; self._factory=url_factory
         self._on_disconnect=on_disconnect; self._build(); self.after(400,self._open)
     def _build(self):
         hdr=tk.Frame(self,bg=P["panel"],height=38); hdr.pack(fill="x"); hdr.pack_propagate(False)
@@ -43,15 +44,18 @@ class VncWindow(tk.Toplevel):
                   relief="flat",padx=12,pady=8,font=theme.fonts().ui_font(9)).pack(side="left",padx=4)
         tk.Label(body,text="v1 (planned): embedded VNC viewer with direct input capture.",
                  bg=P["bg"],fg=P["dim"],font=theme.fonts().ui_font(8)).pack()
+    def _url(self):
+        # each kickoff URL is single-use, so mint a fresh one for every open / reconnect
+        return self._factory() if self._factory else self._kickoff
     def _open(self):
         try:
-            webbrowser.open(self._kickoff)
+            webbrowser.open(self._url())
             self._st.configure(text="Opened in browser",fg=P["text"])
             self._btn.configure(text="Reopen Display")
         except Exception as e:
             self._st.configure(text=f"Error: {e}",fg=P.get("danger","#ff6b6b"))
     def _copy(self):
-        self.clipboard_clear(); self.clipboard_append(self._kickoff)
+        self.clipboard_clear(); self.clipboard_append(self._url())
         self._st.configure(text="URL copied",fg=P["text"])
     def _on_close(self):
         if self._on_disconnect: self._on_disconnect()

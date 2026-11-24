@@ -11,11 +11,11 @@ except ImportError:
     _WS_AVAILABLE = False
 
 class TerminalWindow(tk.Toplevel):
-    def __init__(self,master,*,tunnel_host:str,session_cookie:str):
+    def __init__(self,master,*,tunnel_host:str,session_cookie:str,url:str|None=None):
         super().__init__(master)
         self.title("TEK — Kaggle Runtime Terminal"); self.geometry("900x560")
         self.configure(bg=P["bg"]); self.protocol("WM_DELETE_WINDOW",self._close)
-        self._host=tunnel_host; self._cookie=session_cookie
+        self._host=tunnel_host; self._cookie=session_cookie; self._url=url
         self._ws=None; self._q:queue.Queue[str]=queue.Queue(); self._done=False
         self._hist:list[str]=[]; self._hidx=-1
         self._build(); self._connect()
@@ -46,13 +46,18 @@ class TerminalWindow(tk.Toplevel):
             self._append("[ERROR] Install websocket-client: pip install websocket-client\n")
             self._st.configure(text="Missing: websocket-client",fg=P.get("danger","#ff6b6b")); return
         ctx=ssl.create_default_context(); ctx.set_alpn_protocols(["http/1.1"])
-        self._ws=_ws.WebSocketApp(f"wss://{self._host}/tek/terminal",
-            header={"Cookie":f"tek_session={self._cookie}","Origin":f"https://{self._host}"},
-            on_open=lambda ws:self._q.put("[Connected]\n") or self.after(0,lambda:self._st.configure(text="Connected",fg=P["text"])),
-            on_message=lambda ws,m:self._q.put(m),
-            on_error=lambda ws,e:self._q.put(f"\n[Error: {e}]\n") or self.after(0,lambda:self._st.configure(text=f"Error",fg=P.get("danger","#ff6b6b"))),
-            on_close=lambda ws,c,m:self._q.put(f"\n[Closed]\n") if not self._done else None)
-        threading.Thread(target=self._ws.run_forever,kwargs={"sslopt":{"context":ctx}},daemon=True).start()
+        # Worker-thread callbacks ONLY put items on a queue; the Tk thread (_poll) applies them.
+        # (str = terminal output, tuple = ("status", text, ok))
+        self._ws=_ws.WebSocketApp(self._url or f"wss://{self._host}/tek/terminal",
+            header={"Cookie":f"tek_session={self._cookie}"},
+            on_open=lambda ws:(self._q.put("[Connected]\n"), self._q.put(("status","Connected",True))),
+            on_message=lambda ws,m:self._q.put(m if isinstance(m,str) else bytes(m).decode(errors="replace")),
+            on_error=lambda ws,e:(self._q.put(f"\n[Error: {e}]\n"), self._q.put(("status","Error",False))),
+            on_close=lambda ws,c,m:(None if self._done else (self._q.put(f"\n[Closed]\n"), self._q.put(("status","Disconnected",False)))))
+        # `origin=` (not a header) so the library sends exactly ONE Origin, matching the tunnel host.
+        threading.Thread(target=self._ws.run_forever,
+                         kwargs={"sslopt":{"context":ctx},"origin":f"https://{self._host}"},
+                         daemon=True).start()
     def _send(self,event=None):
         cmd=self._inp.get()
         if not cmd.strip(): return
@@ -66,7 +71,13 @@ class TerminalWindow(tk.Toplevel):
         self._st.configure(text="Disconnected",fg=P["muted"])
     def _poll(self):
         try:
-            while True: self._append(self._q.get_nowait())
+            while True:
+                item=self._q.get_nowait()
+                if isinstance(item,tuple):
+                    _,text,ok=item
+                    self._st.configure(text=text,fg=P["text"] if ok else P.get("danger","#ff6b6b"))
+                else:
+                    self._append(item)
         except queue.Empty: pass
         if not self._done: self.after(100,self._poll)
     def _append(self,text):
